@@ -1,0 +1,92 @@
+"""SQLAlchemy ORM 모델 + DiscussionState <-> ORM 행 변환.
+
+`DiscussionState` 의 스칼라 필드는 전용 컬럼으로, 복잡한 컬렉션(에이전트 목록,
+단계별 발언 기록, 요약, 개입)은 JSON 컬럼으로 직렬화 매핑한다 — 한 토론 =
+`discussions` 테이블 1행.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import JSON, Boolean, Column, String, Text
+from sqlalchemy.orm import declarative_base
+
+from .schemas import DiscussionState
+
+Base = declarative_base()
+
+#: DiscussionState 의 list 계열 필드 — JSON 컬럼으로 직렬화 저장한다.
+_JSON_FIELDS = (
+    "agents",
+    "phase_1_opinions",
+    "phase_2_critiques",
+    "phase_3_rebuttals",
+    "phase_4_revisions",
+    "phase_5_conclusions",
+    "phase_summaries",
+    "user_interventions",
+)
+
+
+class DiscussionRow(Base):
+    """`discussions` 테이블 — DiscussionState 1건을 1행으로 매핑한다."""
+
+    __tablename__ = "discussions"
+
+    # --- 스칼라 컬럼 (조회 / 필터용) ---
+    discussion_id = Column(String, primary_key=True)
+    topic = Column(String, nullable=False)
+    status = Column(String, nullable=False, index=True)
+    current_phase = Column(String, nullable=False)
+    force_consensus = Column(Boolean, nullable=False, default=False)
+    error = Column(Text, nullable=True)
+    final_joint_agreement = Column(Text, nullable=True)
+    created_at = Column(String, nullable=False)          # ISO-8601 문자열
+    updated_at = Column(String, nullable=False, index=True)
+
+    # --- JSON 컬럼 (복잡한 딕셔너리/리스트 필드 직렬화) ---
+    agents = Column(JSON, nullable=False, default=list)
+    phase_1_opinions = Column(JSON, nullable=False, default=list)
+    phase_2_critiques = Column(JSON, nullable=False, default=list)
+    phase_3_rebuttals = Column(JSON, nullable=False, default=list)
+    phase_4_revisions = Column(JSON, nullable=False, default=list)
+    phase_5_conclusions = Column(JSON, nullable=False, default=list)
+    phase_summaries = Column(JSON, nullable=False, default=list)
+    user_interventions = Column(JSON, nullable=False, default=list)
+
+
+def state_to_row(state: DiscussionState) -> DiscussionRow:
+    """DiscussionState -> DiscussionRow (insert/merge 용).
+
+    `model_dump(mode="json")` 로 모든 필드를 JSON 안전 값으로 평탄화한다.
+    """
+    dumped = state.model_dump(mode="json")
+    return DiscussionRow(
+        discussion_id=dumped["discussion_id"],
+        topic=dumped["topic"],
+        status=dumped["status"],
+        current_phase=dumped["current_phase"],
+        force_consensus=dumped["force_consensus"],
+        error=dumped["error"],
+        final_joint_agreement=dumped["final_joint_agreement"],
+        created_at=dumped["created_at"],
+        updated_at=dumped["updated_at"],
+        **{field: dumped[field] for field in _JSON_FIELDS},
+    )
+
+
+def row_to_state(row: DiscussionRow) -> DiscussionState:
+    """DiscussionRow -> DiscussionState (Pydantic 재검증)."""
+    data: dict = {
+        "discussion_id": row.discussion_id,
+        "topic": row.topic,
+        "status": row.status,
+        "current_phase": row.current_phase,
+        "force_consensus": row.force_consensus,
+        "error": row.error,
+        "final_joint_agreement": row.final_joint_agreement,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    for field in _JSON_FIELDS:
+        data[field] = getattr(row, field) or []
+    return DiscussionState.model_validate(data)

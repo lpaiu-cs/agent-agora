@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 환경 변수 / 시크릿
+.env
+.env.*
+
+# SQLite 데이터베이스 (런타임 생성물)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / 에디터
+.DS_Store
+*.swp
+.idea/
+.vscode/
