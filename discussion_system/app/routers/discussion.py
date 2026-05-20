@@ -1,9 +1,10 @@
 """토론 관련 REST + WebSocket 엔드포인트.
 
-phase-6: 인메모리 매니저 레지스트리(`_managers`)를 완전히 제거했다. 모든 라우터는
-DB(`database`)에서 discussion_id 로 상태를 로드하고, 무상태 `Orchestrator` 의
-이벤트 진입점(`trigger` → `process_event`)을 호출한다. WebSocket 연결만은 본질적
-으로 인메모리이므로 `SocketRegistry` 가 브로드캐스트용으로 보관한다.
+phase-6: 인메모리 매니저 레지스트리(`_managers`)를 제거 — 라우터는 DB 에서
+상태를 로드하고 무상태 `Orchestrator` 의 이벤트 진입점을 호출한다.
+phase-8: 인프라 객체(LLM 풀·오케스트레이터·소켓 레지스트리)를 모듈 전역에서
+FastAPI `app.state` 로 격상하고, HTTP 라우터는 `Depends` 로 주입받는다 —
+모듈 임포트 순서 의존을 끊어 결합도를 낮춘다 (구조 검토 ③ 교정).
 """
 
 from __future__ import annotations
@@ -11,10 +12,17 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
 from .. import database
-from ..manager import LLMClientPool, Orchestrator, PipelineEvent
+from ..manager import Orchestrator, PipelineEvent
 from ..schemas import (
     CreateDiscussionRequest,
     CreateDiscussionResponse,
@@ -62,10 +70,14 @@ class SocketRegistry:
             self.unregister(discussion_id, ws)
 
 
-#: 모듈 수준 단일 인스턴스. `pool`/`orchestrator` 는 main.py lifespan 이 사용.
-sockets = SocketRegistry()
-pool = LLMClientPool()
-orchestrator = Orchestrator(pool, sockets.broadcast)
+# ---------------------------------------------------------------------------
+# 의존성 — app.state 에 바인딩된 인프라 객체를 라우터로 주입한다.
+# 풀/오케스트레이터/소켓 레지스트리의 생명주기는 main.py lifespan 이 소유하며,
+# 라우터는 모듈 전역 변수에 의존하지 않는다 (결합도↓ — 구조 검토 ③ 교정).
+# ---------------------------------------------------------------------------
+def get_orchestrator(request: Request) -> Orchestrator:
+    """HTTP 요청 컨텍스트에서 app.state 의 Orchestrator 를 주입한다."""
+    return request.app.state.orchestrator
 
 
 async def _load_or_404(discussion_id: str) -> DiscussionState:
@@ -80,7 +92,10 @@ async def _load_or_404(discussion_id: str) -> DiscussionState:
 # REST 엔드포인트
 # ---------------------------------------------------------------------------
 @router.post("", response_model=CreateDiscussionResponse, status_code=201)
-async def create_discussion(req: CreateDiscussionRequest) -> CreateDiscussionResponse:
+async def create_discussion(
+    req: CreateDiscussionRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> CreateDiscussionResponse:
     """새 토론을 DB 에 영속화하고 START 이벤트로 파이프라인을 기동한다."""
     discussion_id = uuid.uuid4().hex
     state = DiscussionState(
@@ -105,7 +120,10 @@ async def get_discussion(discussion_id: str) -> DiscussionState:
 
 
 @router.post("/{discussion_id}/advance", status_code=202)
-async def advance_discussion(discussion_id: str) -> dict[str, str]:
+async def advance_discussion(
+    discussion_id: str,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> dict[str, str]:
     """다음 단계 진입을 승인한다. WAITING_FOR_USER 가 아니면 HTTP 409."""
     state = await _load_or_404(discussion_id)
     if state.status is not DiscussionStatus.WAITING_FOR_USER:
@@ -120,7 +138,9 @@ async def advance_discussion(discussion_id: str) -> dict[str, str]:
 
 @router.post("/{discussion_id}/interventions", status_code=201)
 async def add_intervention(
-    discussion_id: str, intervention: UserIntervention
+    discussion_id: str,
+    intervention: UserIntervention,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
 ) -> dict[str, str]:
     """유저 개입을 주입한다 (낙관적 락으로 동시 갱신 충돌을 흡수)."""
     await _load_or_404(discussion_id)
@@ -130,7 +150,9 @@ async def add_intervention(
 
 @router.post("/{discussion_id}/manual-response", status_code=202)
 async def submit_manual_response(
-    discussion_id: str, req: ManualResponseRequest
+    discussion_id: str,
+    req: ManualResponseRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
 ) -> dict[str, str]:
     """수동(manual) 에이전트의 응답을 주입해 MANUAL_RESPONSE 이벤트를 트리거한다.
 
@@ -146,7 +168,8 @@ async def submit_manual_response(
         )
     orchestrator.trigger(
         discussion_id, PipelineEvent.MANUAL_RESPONSE,
-        {"agent_id": req.agent_id, "phase": req.phase.value, "content": req.content},
+        {"agent_id": req.agent_id, "phase": req.phase.value,
+         "content": req.content},
     )
     return {"status": "manual_response_accepted", "discussion_id": discussion_id}
 
@@ -156,8 +179,14 @@ async def submit_manual_response(
 # ---------------------------------------------------------------------------
 @router.websocket("/{discussion_id}/ws")
 async def discussion_ws(websocket: WebSocket, discussion_id: str) -> None:
-    """토론 진행 상황 실시간 스트림 + 유저 개입/진행 수신 채널."""
+    """토론 진행 상황 실시간 스트림 + 유저 개입/진행 수신 채널.
+
+    인프라 객체는 `websocket.app.state` 에서 직접 얻는다 (WS 경로는 HTTP 와
+    의존성 주입 결이 달라, app.state 직접 접근이 더 단순·확실하다).
+    """
     await websocket.accept()
+    orchestrator: Orchestrator = websocket.app.state.orchestrator
+    sockets: SocketRegistry = websocket.app.state.sockets
 
     state = await database.load_state(discussion_id)
     if state is None:
@@ -178,11 +207,14 @@ async def discussion_ws(websocket: WebSocket, discussion_id: str) -> None:
             payload={"state": state.model_dump(mode="json")},
         ).model_dump(mode="json")
     )
+    # 수동 대기 '2중 방어선' — PENDING_MANUAL_INPUT 이면 복붙 페이로드를 이 소켓에
+    # 재전송한다. 새로고침·재연결로 복붙 터널 패널이 증발해도 복구할 수 있다.
+    await orchestrator.emit_manual_input_required_for_socket(discussion_id, websocket)
 
     try:
         while True:
             raw = await websocket.receive_json()
-            await _handle_client_message(discussion_id, websocket, raw)
+            await _handle_client_message(discussion_id, websocket, raw, orchestrator)
     except WebSocketDisconnect:
         sockets.unregister(discussion_id, websocket)
     except Exception:  # noqa: BLE001 - 비정상 소켓 정리
@@ -191,7 +223,7 @@ async def discussion_ws(websocket: WebSocket, discussion_id: str) -> None:
 
 
 async def _handle_client_message(
-    discussion_id: str, websocket: WebSocket, raw: dict
+    discussion_id: str, websocket: WebSocket, raw: dict, orchestrator: Orchestrator
 ) -> None:
     """클라이언트 -> 서버 WS 메시지를 처리한다."""
     msg_type = raw.get("type")

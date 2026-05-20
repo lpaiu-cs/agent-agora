@@ -14,7 +14,9 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from . import __version__, database
+from .manager import LLMClientPool, Orchestrator
 from .routers import discussion
+from .routers.discussion import SocketRegistry
 
 #: index.html 단일 파일 UI 템플릿 디렉터리.
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -30,12 +32,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """앱 수명주기 관리.
 
-    기동 시: SQLite 영속성 레이어(테이블)를 초기화하고, 크래시 복구
-    coordinator(`Orchestrator.recover`)를 가동해 중단된 토론을 재기동/유지한다.
-    종료 시: 글로벌 LLM 클라이언트 풀을 일괄 폐쇄한다.
+    기동 시: 영속성 레이어(테이블)를 초기화하고, 인프라 객체(LLM 풀·소켓
+    레지스트리·오케스트레이터)를 생성해 `app.state` 에 바인딩한 뒤, 크래시 복구
+    coordinator 를 가동한다. 종료 시: LLM 풀과 DB 엔진을 일괄 폐쇄한다.
+
+    인프라 객체의 생명주기를 lifespan 이 소유하므로, 라우터/매니저가 모듈 전역
+    변수와 임포트 순서에 의존하지 않는다.
     """
     await database.init_db()
-    recovered = await discussion.orchestrator.recover()
+
+    sockets = SocketRegistry()
+    pool = LLMClientPool()
+    orchestrator = Orchestrator(pool, sockets.broadcast)
+    app.state.sockets = sockets
+    app.state.pool = pool
+    app.state.orchestrator = orchestrator
+
+    recovered = await orchestrator.recover()
     logger.info(
         "Agent Agora %s 기동 — DB 초기화 + 크래시 복구 "
         "(RUNNING 재기동 %d / PENDING 유지 %d)",
@@ -44,9 +57,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovered["pending_preserved"],
     )
     yield
-    await discussion.pool.aclose()
+    await pool.aclose()
     await database.dispose_engine()
     logger.info("LLM 클라이언트 풀 · DB 엔진 폐쇄 완료 — 서버 종료")
+
 
 app = FastAPI(
     title="Agent Agora — 다중 에이전트 토론 시스템",

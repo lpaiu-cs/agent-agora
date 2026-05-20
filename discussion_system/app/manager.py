@@ -591,6 +591,48 @@ class Orchestrator:
             {"intervention": intervention.model_dump(mode="json")},
         )
 
+    async def emit_manual_input_required_for_socket(
+        self, discussion_id: str, websocket
+    ) -> None:
+        """수동 대기 '2중 방어선' — 특정 WebSocket 1개에 manual_input_required 재전송.
+
+        WS 접속(특히 새로고침·재연결) 직후 호출된다. 세션이 PENDING_MANUAL_INPUT
+        이면 아직 발언하지 않은 수동 에이전트별로 딥/일반 복사 페이로드를 만들어
+        해당 소켓에만 보낸다 — 복붙 터널 패널이 증발해 세션이 고착되는 것을 막는다.
+        best-effort: 어떤 실패도 호출부(WS 핸들러)로 전파하지 않는다.
+        """
+        try:
+            state = await self._load(discussion_id)
+            if (state is None
+                    or state.status is not DiscussionStatus.PENDING_MANUAL_INPUT):
+                return
+            phase = state.current_phase
+            if phase not in PHASE_SEQUENCE:
+                return
+            record = state.record_for_phase(phase)
+            posted = {t.agent_id for t in record}
+            prior = list(record)
+            for agent in state.agents:
+                if (agent.provider is not ModelProvider.MANUAL
+                        or agent.agent_id in posted):
+                    continue
+                message = WSMessage(
+                    type=WSMessageType.MANUAL_INPUT_REQUIRED,
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "phase": phase.value,
+                        "deep_copy": generate_deep_copy(
+                            state, agent.agent_id, phase, prior),
+                        "general_copy": generate_general_copy(
+                            state, agent.agent_id, phase, prior),
+                    },
+                )
+                await websocket.send_json(message.model_dump(mode="json"))
+        except Exception as exc:  # noqa: BLE001 - best-effort 재전송, 실패해도 무시
+            logger.warning(
+                "manual_input_required 소켓 재전송 실패(%s): %r", discussion_id, exc
+            )
+
     # ----- 전이 핸들러 -----
     async def _on_recover(self, state: DiscussionState) -> None:
         """크래시 복구 전이. RUNNING 단계만 멱등 재기동한다."""

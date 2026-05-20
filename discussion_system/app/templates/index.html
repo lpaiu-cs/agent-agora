@@ -146,6 +146,8 @@ let ws = null;
 let agentsById = {};       // agent_id -> AgentConfig
 let bubbles = {};          // `${phase}__${agentId}` -> { wrap, body, ptype, streaming }
 let lastCompletedPhase = null;
+let wsReconnectAttempts = 0;   // WebSocket 지수 백오프 재연결 시도 횟수
+let wsReconnectTimer = null;   // 예약된 재연결 타이머 핸들
 
 // ---- DOM 핸들 --------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -235,6 +237,8 @@ async function startDiscussion() {
     discussionId = (await res.json()).discussion_id;
     timelineEl.innerHTML = '';
     bubbles = {};
+    wsReconnectAttempts = 0;
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (e) {} }
     connectWS(discussionId);
   } catch (e) {
@@ -246,13 +250,40 @@ async function startDiscussion() {
 function connectWS(id) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/discussions/${id}/ws`);
-  ws.onopen = () => setStatus('연결됨 — 토론 진행 중', 'run');
+  ws.onopen = () => {
+    wsReconnectAttempts = 0;            // 연결 성공 — 백오프 초기화
+    setStatus('연결됨 — 토론 진행 중', 'run');
+  };
   ws.onmessage = (ev) => {
     try { handleMessage(JSON.parse(ev.data)); }
     catch (e) { console.error('WS 메시지 처리 오류', e); }
   };
-  ws.onclose = () => { if (discussionId) setStatus('연결 종료'); };
-  ws.onerror = () => setStatus('연결 오류', 'error');
+  ws.onclose = (ev) => {
+    if (ev && ev.code === 4004) {       // 서버: 토론 없음 — 재연결 무의미
+      setStatus('토론을 찾을 수 없음', 'error');
+      return;
+    }
+    scheduleReconnect(id);              // 그 외 단절 → 지수 백오프 재연결
+  };
+  ws.onerror = () => {};                // onclose 가 이어서 재연결을 처리한다
+}
+
+// 끊긴 WebSocket 을 지수 백오프(1·2·4…최대 30초)로 자동 재연결한다.
+function scheduleReconnect(id) {
+  if (!discussionId || discussionId !== id) return;   // 종료/다른 토론 — 재연결 안 함
+  if (wsReconnectTimer) return;                       // 이미 예약됨
+  wsReconnectAttempts += 1;
+  if (wsReconnectAttempts > 10) {
+    setStatus('연결 끊김 — 재연결 한도 초과, 페이지를 새로고침하세요', 'error');
+    return;
+  }
+  const delay = Math.min(30000, 1000 * 2 ** (wsReconnectAttempts - 1));
+  setStatus(`연결 끊김 — ${Math.round(delay / 1000)}초 후 재연결 (#${wsReconnectAttempts})`,
+            'error');
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWS(id);
+  }, delay);
 }
 
 // ---- WebSocket 메시지 디스패치 ---------------------------------------------
@@ -423,39 +454,65 @@ async function submitManual(agentId, phase, panel) {
   }
 }
 
+// 수동 입력 패널을 생성하거나(없으면) 복사 페이로드를 갱신한다(있으면).
+// 새로고침/재연결로 패널이 증발해도 renderSnapshot 이 재호출해 복구할 수 있다.
 function onManualInputRequired(payload) {
   const { agent_id, phase, deep_copy, general_copy } = payload;
   const b = ensureBubble(phase, agent_id);
-  if (b.wrap.querySelector('.manual-panel')) return;   // 패널 중복 방지
   const name = (agentsById[agent_id] || {}).name || agent_id;
   setStatus('⏸ 수동 입력 대기 — ' + name, 'waiting');
   if (!b.body.textContent) b.body.textContent = '(수동 에이전트 — 응답 대기 중…)';
 
+  let panel = b.wrap.querySelector('.manual-panel');
+  if (!panel) {
+    panel = buildManualPanel(agent_id, phase);
+    b.wrap.appendChild(panel);
+  }
+  applyManualPayloads(panel, deep_copy, general_copy);
+  scrollTimeline();
+}
+
+// 복붙 패널 DOM 을 만든다 (복사 버튼·붙여넣기창·제출 버튼 + 이벤트 배선).
+function buildManualPanel(agentId, phase) {
   const panel = document.createElement('div');
   panel.className = 'manual-panel mt-2 pt-2 border-t border-dashed border-amber-400';
   panel.innerHTML =
     `<div class="text-[11px] text-amber-700 mb-1">🔌 Manual Tunnel — `
     + `복사본을 외부 LLM 에 붙여넣고, 받은 응답을 아래 칸에 붙여넣어 제출하세요.</div>`
     + `<div class="flex gap-1 mb-1">`
-    + `<button class="copy-deep text-[11px] px-2 py-1 rounded bg-slate-700 text-white">`
-    + `📋 Deep Copy</button>`
-    + `<button class="copy-general text-[11px] px-2 py-1 rounded bg-sky-600 text-white">`
-    + `📋 General Copy</button></div>`
+    + `<button class="copy-deep text-[11px] px-2 py-1 rounded bg-slate-700 text-white `
+    + `disabled:bg-slate-300 disabled:cursor-not-allowed">📋 Deep Copy</button>`
+    + `<button class="copy-general text-[11px] px-2 py-1 rounded bg-sky-600 text-white `
+    + `disabled:bg-slate-300 disabled:cursor-not-allowed">📋 General Copy</button></div>`
     + `<textarea class="manual-input w-full text-sm border border-slate-300 rounded `
     + `px-2 py-1 mb-1" rows="3" placeholder="외부 LLM 의 응답을 여기에 붙여넣으세요"></textarea>`
     + `<button class="manual-submit w-full text-sm py-1 rounded bg-amber-500 `
     + `text-white font-bold">응답 제출</button>`;
-  b.wrap.appendChild(panel);
-  panel.querySelector('.copy-deep')
-       .addEventListener('click', (e) => copyText(deep_copy, e.currentTarget));
-  panel.querySelector('.copy-general')
-       .addEventListener('click', (e) => copyText(general_copy, e.currentTarget));
+  panel.querySelector('.copy-deep').addEventListener('click', (e) => {
+    if (panel._deepCopy) copyText(panel._deepCopy, e.currentTarget);
+  });
+  panel.querySelector('.copy-general').addEventListener('click', (e) => {
+    if (panel._generalCopy) copyText(panel._generalCopy, e.currentTarget);
+  });
   panel.querySelector('.manual-submit')
-       .addEventListener('click', () => submitManual(agent_id, phase, panel));
-  scrollTimeline();
+       .addEventListener('click', () => submitManual(agentId, phase, panel));
+  return panel;
+}
+
+// 복사 페이로드를 패널에 저장/갱신한다. 아직 페이로드가 없으면 복사 버튼만
+// 비활성화하고 붙여넣기·제출은 항상 열어 둔다 — 세션 고착(deadlock)을 즉시 해소.
+function applyManualPayloads(panel, deepCopy, generalCopy) {
+  if (deepCopy) panel._deepCopy = deepCopy;
+  if (generalCopy) panel._generalCopy = generalCopy;
+  panel.querySelector('.copy-deep').disabled = !panel._deepCopy;
+  panel.querySelector('.copy-general').disabled = !panel._generalCopy;
 }
 
 function renderSnapshot(state) {
+  // 재연결 시 중복 렌더를 막기 위해 타임라인을 비우고 스냅샷으로 완전 재구성한다.
+  timelineEl.innerHTML = '';
+  bubbles = {};
+  hideInterventionBar();
   agentsById = {};
   (state.agents || []).forEach((a) => { agentsById[a.agent_id] = a; });
   if (state.topic) $('topicInput').value = state.topic;
@@ -475,9 +532,26 @@ function renderSnapshot(state) {
     renderError(state.error || '오류 상태');
   } else if (state.status === 'pending_manual_input') {
     setStatus('⏸ 수동 에이전트 응답 대기 중', 'waiting');
+    restoreManualPanels(state);   // 새로고침/재연결 시 복붙 터널 패널 복구
   } else if (state.status === 'running') {
     setStatus('진행 중…', 'run');
   }
+}
+
+// PENDING_MANUAL_INPUT 스냅샷에서 — 현재 단계에 아직 발언하지 않은 수동 공급자
+// 에이전트를 역추적해 복붙 패널을 강제 복구한다. 복사 페이로드는 백엔드의
+// manual_input_required 재전송이 채우며, 그 전이라도 붙여넣기·제출은 가능하다.
+function restoreManualPanels(state) {
+  const phase = state.current_phase;
+  const field = PHASE_FIELD[phase];
+  if (!field) return;
+  const posted = new Set((state[field] || []).map((t) => t.agent_id));
+  (state.agents || []).forEach((a) => {
+    if (a.provider === 'manual' && !posted.has(a.agent_id)) {
+      onManualInputRequired({ agent_id: a.agent_id, phase: phase,
+                              deep_copy: null, general_copy: null });
+    }
+  });
 }
 
 // ---- 동기식 대기 큐 인터페이스 (개입 컴포넌트) ------------------------------
