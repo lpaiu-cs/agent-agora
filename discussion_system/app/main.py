@@ -30,18 +30,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """앱 수명주기 관리.
 
-    글로벌 LLM 클라이언트 풀(`DiscussionRegistry.pool`)은 모든 토론 세션이
-    공유하며, 서버 종료 시 이 lifespan 의 종료 구간에서 일괄 폐쇄한다.
-    기동 시 SQLite 영속성 레이어(테이블)를 초기화한다.
+    기동 시: SQLite 영속성 레이어(테이블)를 초기화하고, 크래시 복구
+    coordinator(`Orchestrator.recover`)를 가동해 중단된 토론을 재기동/유지한다.
+    종료 시: 글로벌 LLM 클라이언트 풀을 일괄 폐쇄한다.
     """
-    database.init_db()
+    await database.init_db()
+    recovered = await discussion.orchestrator.recover()
     logger.info(
-        "Agent Agora %s 기동 — SQLite 영속성 · 글로벌 LLM 클라이언트 풀 준비됨",
+        "Agent Agora %s 기동 — DB 초기화 + 크래시 복구 "
+        "(RUNNING 재기동 %d / PENDING 유지 %d)",
         __version__,
+        recovered["running_recovered"],
+        recovered["pending_preserved"],
     )
     yield
-    await discussion.registry.pool.aclose()
-    logger.info("글로벌 LLM 클라이언트 풀 폐쇄 완료 — 서버 종료")
+    await discussion.pool.aclose()
+    await database.dispose_engine()
+    logger.info("LLM 클라이언트 풀 · DB 엔진 폐쇄 완료 — 서버 종료")
 
 app = FastAPI(
     title="Agent Agora — 다중 에이전트 토론 시스템",

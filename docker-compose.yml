@@ -1,0 +1,47 @@
+# Agent Agora — web(FastAPI) + db(PostgreSQL) 멀티 컨테이너 구성.
+#   docker compose up --build
+# `web` 는 환경 변수 DATABASE_URL 로 내부 네트워크의 `db` 서비스에 연결한다.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agora
+      POSTGRES_PASSWORD: agora_secret
+      POSTGRES_DB: agora
+    volumes:
+      # 영속 볼륨 — 컨테이너를 내려도 토론 데이터가 보존된다.
+      - agora_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agora -d agora"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # 비동기 PostgreSQL 드라이버로 내부 네트워크의 db 서비스에 접속.
+      DATABASE_URL: postgresql+asyncpg://agora:agora_secret@db:5432/agora
+      # LLM API Key — 호스트 환경 변수에서 전달 (미설정 시 빈 값).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OLLAMA_HOST: ${OLLAMA_HOST:-}
+    depends_on:
+      # db 헬스체크가 통과한 뒤에야 web 이 기동된다.
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  agora_pgdata:

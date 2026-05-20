@@ -1,0 +1,16 @@
+# Docker 빌드 컨텍스트에서 제외 — 이미지·전송 경량화
+.git
+.gitignore
+**/__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+.venv/
+venv/
+.env
+.env.*
+.DS_Store
+Dockerfile
+docker-compose.yml
+.dockerignore

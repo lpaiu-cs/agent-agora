@@ -275,6 +275,10 @@ class DiscussionState(BaseModel):
     # --- 타임스탬프 / 오류 ---
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+    version: int = Field(
+        default=0,
+        description="낙관적 락(optimistic lock) 버전 — DB 저장에 성공할 때마다 +1",
+    )
     error: Optional[str] = Field(
         default=None, description="status=ERROR 일 때의 오류 메시지"
     )
