@@ -58,6 +58,22 @@ CONSENSUS_SPEAKER_ID = "consensus"
 _COMMIT_RETRIES = 6
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """양의 정수 환경변수를 읽는다 — 미설정·형식 오류·0 이하이면 ``default`` 로 흡수."""
+    try:
+        parsed = int(os.getenv(name, ""))
+    except ValueError:
+        return default
+    return parsed if parsed >= 1 else default
+
+
+#: 동시에 진행할 수 있는 무거운 LLM 호출(외부 API·추론)의 최대 개수.
+#: 토론 수백 개가 한꺼번에 이벤트를 발사해도, 이 수치를 넘는 LLM 호출은 세마포어
+#: 에서 대기한다 — 동시 코루틴 폭주로 인한 CPU 스파이크와 낙관적 락 경합 폭증을
+#: 막는 백프레셔 장치다. ``AGORA_MAX_CONCURRENT_LLM`` 환경변수로 조정한다.
+_MAX_CONCURRENT_LLM = _positive_int_env("AGORA_MAX_CONCURRENT_LLM", 8)
+
+
 # ===========================================================================
 # 예외 / 이벤트
 # ===========================================================================
@@ -491,6 +507,10 @@ class Orchestrator:
         self._broadcast = broadcast
         # 진행 중 전이 태스크 핸들 (GC 방지용 — 토론별 상태가 아니다).
         self._inflight: set[asyncio.Task] = set()
+        # 무거운 LLM 호출 동시성 상한 — 토론 수가 폭증해도 외부 API·추론을 실제로
+        # 수행하는 코루틴 수를 _MAX_CONCURRENT_LLM 개로 엄격히 제한한다 (백프레셔).
+        # 초과분은 이 세마포어에서 대기하며, trigger 의 태스크 자체는 막지 않는다.
+        self._llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_LLM)
 
     # ----- 공개: 엔드포인트/복구가 호출 -----
     def trigger(
@@ -870,18 +890,33 @@ class Orchestrator:
         self, agent: AgentConfig, system: str, user: str,
         on_token: Optional[TokenCallback] = None,
     ) -> str:
-        """공급자별 스트리밍 LLM 호출로 분기한다 (풀에서 클라이언트 재사용)."""
+        """공급자별 스트리밍 LLM 호출로 분기한다 (풀에서 클라이언트 재사용).
+
+        실제 네트워크·추론 비용이 드는 ``_call_*`` 호출은 고정 크기 세마포어
+        (``self._llm_semaphore``) 안에서만 수행한다 — 토론 수백 개가 한꺼번에
+        이벤트를 발사해도 동시에 진행되는 무거운 LLM 호출 수를 엄격히 제한해,
+        CPU 폭주와 낙관적 락(StaleStateError) 경합 폭증을 막는다 (구조 검토 ② 교정).
+        모든 LLM 경로(에이전트 턴·합의안 합성·단계 요약)가 이 함수를 거치므로,
+        여기 한 곳의 세마포어가 전체 추론 동시성의 단일 통제점이 된다.
+        """
         provider = agent.get_provider()
         client = self._pool.get(provider)
-        if provider is ModelProvider.OPENAI:
-            return await _call_openai(client, agent.model, system, user,
-                                      agent.temperature, agent.max_tokens, on_token)
-        if provider is ModelProvider.ANTHROPIC:
-            return await _call_anthropic(client, agent.model, system, user,
-                                         agent.temperature, agent.max_tokens, on_token)
-        if provider is ModelProvider.OLLAMA:
-            return await _call_ollama(client, agent.model, system, user,
-                                      agent.temperature, agent.max_tokens, on_token)
+        async with self._llm_semaphore:
+            if provider is ModelProvider.OPENAI:
+                return await _call_openai(
+                    client, agent.model, system, user,
+                    agent.temperature, agent.max_tokens, on_token,
+                )
+            if provider is ModelProvider.ANTHROPIC:
+                return await _call_anthropic(
+                    client, agent.model, system, user,
+                    agent.temperature, agent.max_tokens, on_token,
+                )
+            if provider is ModelProvider.OLLAMA:
+                return await _call_ollama(
+                    client, agent.model, system, user,
+                    agent.temperature, agent.max_tokens, on_token,
+                )
         raise DiscussionError(f"미지원 LLM 공급자: {provider}")
 
     async def _synthesize(self, state: DiscussionState) -> str:

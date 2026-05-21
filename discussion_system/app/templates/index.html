@@ -476,6 +476,9 @@ function onManualInputRequired(payload) {
 function buildManualPanel(agentId, phase) {
   const panel = document.createElement('div');
   panel.className = 'manual-panel mt-2 pt-2 border-t border-dashed border-amber-400';
+  // 작성 중 텍스트 대피/복원(captureDrafts·restoreDrafts)의 매칭 키.
+  panel.dataset.agentId = agentId;
+  panel.dataset.phase = phase;
   panel.innerHTML =
     `<div class="text-[11px] text-amber-700 mb-1">🔌 Manual Tunnel — `
     + `복사본을 외부 LLM 에 붙여넣고, 받은 응답을 아래 칸에 붙여넣어 제출하세요.</div>`
@@ -508,8 +511,41 @@ function applyManualPayloads(panel, deepCopy, generalCopy) {
   panel.querySelector('.copy-general').disabled = !panel._generalCopy;
 }
 
+// 타임라인 재구성 직전 — 작성 중이던 텍스트(수동 응답 초안 + 개입 코멘트)를
+// 메모리로 대피시킨다. innerHTML 초기화로 textarea DOM 이 파괴돼도 글자를 잃지 않게.
+function captureDrafts() {
+  const drafts = { manual: {}, intervention: '' };
+  document.querySelectorAll('.manual-panel').forEach((panel) => {
+    const ta = panel.querySelector('.manual-input');
+    if (ta && ta.value) {
+      const key = (panel.dataset.agentId || '') + '||' + (panel.dataset.phase || '');
+      drafts.manual[key] = ta.value;
+    }
+  });
+  const iv = $('interventionInput');
+  if (iv && iv.value) drafts.intervention = iv.value;
+  return drafts;
+}
+
+// 스냅샷 렌더 + restoreManualPanels 로 새 textarea 가 배치된 직후 — 대피해 둔
+// 텍스트를 되돌린다. 새 칸이 이미 비어 있지 않으면(서버 값 등) 덮어쓰지 않는다.
+function restoreDrafts(drafts) {
+  if (!drafts) return;
+  document.querySelectorAll('.manual-panel').forEach((panel) => {
+    const key = (panel.dataset.agentId || '') + '||' + (panel.dataset.phase || '');
+    const saved = drafts.manual[key];
+    const ta = panel.querySelector('.manual-input');
+    if (saved && ta && !ta.value) ta.value = saved;
+  });
+  const iv = $('interventionInput');
+  if (drafts.intervention && iv && !iv.value) iv.value = drafts.intervention;
+}
+
 function renderSnapshot(state) {
   // 재연결 시 중복 렌더를 막기 위해 타임라인을 비우고 스냅샷으로 완전 재구성한다.
+  // 단, 비우기 전에 작성 중이던 텍스트를 대피시켜 두고(captureDrafts), 재구성이
+  // 끝난 직후 복원한다(restoreDrafts) — 일시적 단절에도 입력 글자를 잃지 않도록.
+  const drafts = captureDrafts();
   timelineEl.innerHTML = '';
   bubbles = {};
   hideInterventionBar();
@@ -536,6 +572,8 @@ function renderSnapshot(state) {
   } else if (state.status === 'running') {
     setStatus('진행 중…', 'run');
   }
+  // 재구성·패널 복구가 모두 끝났다 — 대피시켜 둔 작성 중 텍스트를 복원한다.
+  restoreDrafts(drafts);
 }
 
 // PENDING_MANUAL_INPUT 스냅샷에서 — 현재 단계에 아직 발언하지 않은 수동 공급자
