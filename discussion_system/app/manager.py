@@ -171,6 +171,18 @@ def _latest_convergence(state: DiscussionState, instance_key: str) -> float:
     return 0.0
 
 
+def _stored_decision(state: DiscussionState, instance_key: str) -> Optional[str]:
+    """주어진 단계 인스턴스에 대해 사회자가 내린 진행 결정 (있으면 그 값).
+
+    ``_finish_phase`` 가 게이트에서 결정을 한 번 내려 facilitator_notes 에 남기고,
+    ADVANCE 경로가 같은 결정을 재사용한다 — 두 경로의 plan_next 가 일치한다.
+    """
+    for note in state.facilitator_notes:
+        if note.kind == "decision" and note.phase == instance_key:
+            return note.decision
+    return None
+
+
 # ===========================================================================
 # 멀티 공급자 LLM 호출 레이어 (스트리밍)
 # ===========================================================================
@@ -793,6 +805,7 @@ class Orchestrator:
             nxt = plan_next(
                 _format_of(state), state.current_phase,
                 _latest_convergence(state, state.current_phase),
+                _stored_decision(state, state.current_phase),
             )
             if nxt is not None:
                 await self._run_phase(discussion_id, nxt)
@@ -1270,7 +1283,17 @@ class Orchestrator:
         fmt = _format_of(state)
         summary = await self._summarize_phase(state, phase,
                                               list(state.record_for_phase(phase)))
-        nxt = plan_next(fmt, phase, summary.convergence_score)
+        # 반복 단계 게이트 + 사회자 → 사회자가 라운드 지속 여부를 판단한다.
+        # 결정은 facilitator_notes 에 남아 ADVANCE 경로의 plan_next 도 재사용한다.
+        spec = fmt.phase(phase)
+        facilitated_gate = (
+            spec is not None and spec.repeatable
+            and state.facilitator is not None)
+        decision = None
+        if facilitated_gate:
+            decision = await self._run_facilitator(
+                discussion_id, "decision", phase)
+        nxt = plan_next(fmt, phase, summary.convergence_score, decision)
 
         def mutate(s: DiscussionState) -> None:
             if not any(ps.phase == phase for ps in s.phase_summaries):
@@ -1297,14 +1320,16 @@ class Orchestrator:
                  "final_joint_agreement": state.final_joint_agreement},
             )
         else:
-            # 사회자 중간 조율 — 다음 단계 게이트 직전에 진행 노트를 남긴다.
-            await self._run_facilitator(discussion_id, "between", phase)
+            # 반복 게이트는 'decision' 노트가 진행 코멘트를 겸한다 — between 생략.
+            if not facilitated_gate:
+                await self._run_facilitator(discussion_id, "between", phase)
             nxt_spec = fmt.phase(nxt)
             await self._emit(
                 discussion_id, WSMessageType.AWAITING_USER,
                 {"completed_phase": phase, "next_phase": nxt,
                  "next_round": round_of_key(nxt),
-                 "next_label": _instance_label(nxt_spec, round_of_key(nxt))},
+                 "next_label": _instance_label(nxt_spec, round_of_key(nxt)),
+                 "facilitator_decision": decision},
             )
 
     async def _end_discussion(self, discussion_id: str) -> None:

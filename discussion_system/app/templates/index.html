@@ -1023,8 +1023,14 @@ function onAwaitingUser(payload) {
   } else {
     label += ' — 다음 단계 진입 전 개입할 수 있습니다';
   }
-  // 합의 근접도로 다음 행동을 권고한다 (조기 종료 / 계속 진행).
-  if (lastConvergence != null) {
+  const facDec = payload.facilitator_decision;
+  if (facDec) {
+    // 사회자가 진행을 결정했다 — 그 판단을 우선 안내한다 (근접도 권고 대신).
+    const decLabel = { continue: '문답을 한 라운드 더 진행',
+                       next: '다음 단계로 진행' };
+    label += ` · 🎙 사회자 판단: ${decLabel[facDec] || facDec}`;
+  } else if (lastConvergence != null) {
+    // 합의 근접도로 다음 행동을 권고한다 (사회자 결정이 없을 때만).
     const pct = Math.round(lastConvergence * 100);
     if (lastConvergence >= 0.75) {
       label += ` · 💡 합의 근접도 ${pct}% — 충분히 수렴했습니다, '여기서 종료' 고려`;
