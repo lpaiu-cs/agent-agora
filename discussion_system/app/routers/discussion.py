@@ -176,6 +176,26 @@ async def advance_discussion(
     return {"status": "advance_requested", "discussion_id": discussion_id}
 
 
+@router.post("/{discussion_id}/end", status_code=202)
+async def end_discussion(
+    discussion_id: str,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> dict[str, str]:
+    """게이트 구간에서 토론을 조기 종료한다 (합의 근접도가 높을 때 등).
+
+    남은 단계는 진행하지 않는다. WAITING_FOR_USER 가 아니면 HTTP 409.
+    """
+    state = await _load_or_404(discussion_id)
+    if state.status is not DiscussionStatus.WAITING_FOR_USER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"종료는 'waiting_for_user' 상태에서만 가능합니다 "
+                   f"(현재: {state.status.value}).",
+        )
+    orchestrator.trigger(discussion_id, PipelineEvent.END)
+    return {"status": "end_requested", "discussion_id": discussion_id}
+
+
 @router.post("/{discussion_id}/interventions", status_code=201)
 async def add_intervention(
     discussion_id: str,

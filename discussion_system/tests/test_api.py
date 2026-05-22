@@ -55,6 +55,17 @@ def test_advance_rejects_non_waiting_state(client):
     assert client.post(f"/discussions/{did}/advance").status_code == 409
 
 
+def test_end_rejects_non_waiting_state(client):
+    did = client.post("/discussions", json={
+        "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]
+    # 갓 생성된 토론은 created 상태 — 종료는 waiting_for_user 에서만 가능.
+    assert client.post(f"/discussions/{did}/end").status_code == 409
+
+
+def test_end_unknown_discussion_returns_404(client):
+    assert client.post("/discussions/does-not-exist/end").status_code == 404
+
+
 def test_manual_response_rejects_non_pending_state(client):
     did = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]

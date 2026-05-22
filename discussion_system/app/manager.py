@@ -95,6 +95,7 @@ class PipelineEvent(str, Enum):
     MANUAL_RESPONSE = "manual_response"   # 수동 에이전트 응답 수신
     REVIEW_QUESTION = "review_question"   # 검토 게이트 — 진행자 질문
     REVIEW_APPROVE = "review_approve"     # 검토 게이트 — 진행자 승인
+    END = "end"                          # 게이트에서 토론 조기 종료
     RECOVER = "recover"                   # 서버 재기동 후 크래시 복구
 
 
@@ -661,6 +662,12 @@ class Orchestrator:
             await self._on_review_question(state, payload or {})
         elif event is PipelineEvent.REVIEW_APPROVE:
             await self._on_review_approve(state)
+        elif event is PipelineEvent.END:
+            if state.status is not DiscussionStatus.WAITING_FOR_USER:
+                raise InvalidStateTransition(
+                    f"end 는 WAITING_FOR_USER 에서만 가능 (현재 {state.status.value})"
+                )
+            await self._end_discussion(discussion_id)
         elif event is PipelineEvent.RECOVER:
             await self._on_recover(state)
         else:
@@ -1136,6 +1143,18 @@ class Orchestrator:
             await self._emit(discussion_id, WSMessageType.AWAITING_USER,
                              {"completed_phase": phase})
 
+    async def _end_discussion(self, discussion_id: str) -> None:
+        """게이트 구간에서 토론을 조기 종료한다 — 남은 단계는 진행하지 않는다.
+
+        합의 근접도가 충분히 높을 때 유저가 누르는 '여기서 종료' 의 진입점이다.
+        """
+        state = await self._commit(discussion_id, _mark_completed)
+        await self._emit(
+            discussion_id, WSMessageType.DISCUSSION_COMPLETED,
+            {"discussion_id": discussion_id,
+             "final_joint_agreement": state.final_joint_agreement},
+        )
+
     async def _run_consensus(self, discussion_id: str, phase: str) -> None:
         """마지막 단계 force_consensus=True — 단일 합의안 문서를 합성한다."""
         state = await self._load(discussion_id)
@@ -1477,4 +1496,11 @@ def _append_review_qa(state: DiscussionState, exchange: ReviewExchange) -> None:
 def _set_intercepts(state: DiscussionState, agent_ids: list[str]) -> None:
     """가로채기 대상 에이전트 목록을 설정한다. 멱등."""
     state.intercept_agents = list(agent_ids)
+    state.touch()
+
+
+def _mark_completed(state: DiscussionState) -> None:
+    """토론을 COMPLETED 로 종료 전이한다. 멱등."""
+    state.current_phase = PHASE_COMPLETED
+    state.status = DiscussionStatus.COMPLETED
     state.touch()

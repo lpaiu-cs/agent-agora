@@ -139,3 +139,34 @@ async def test_brainstorm_format_runs_its_four_phases(
     assert st.status is DiscussionStatus.COMPLETED
     assert st.current_phase == "completed"
     assert set(st.phase_records) == {"diverge", "expand", "converge", "action"}
+
+
+async def test_end_event_completes_discussion_at_gate(
+    orchestrator, make_state, patch_llm,
+):
+    """END — WAITING_FOR_USER 게이트에서 조기 종료하면 남은 단계는 진행하지 않는다."""
+    from app.manager import InvalidStateTransition
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        return "발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(discussion_id="early"))
+
+    await orchestrator.process_event("early", PipelineEvent.START)
+    gate = await database.load_state("early")
+    assert gate.status is DiscussionStatus.WAITING_FOR_USER   # 1단계 후 게이트
+
+    await orchestrator.process_event("early", PipelineEvent.END)
+
+    st = await database.load_state("early")
+    assert st.status is DiscussionStatus.COMPLETED
+    assert st.current_phase == "completed"
+    assert set(st.phase_records) == {"opinion"}   # 남은 단계는 실행되지 않음
+
+    # 이미 종료된 토론에 END 재요청 → 거부
+    try:
+        await orchestrator.process_event("early", PipelineEvent.END)
+        raise AssertionError("종료된 토론에 END 가 거부되지 않음")
+    except InvalidStateTransition:
+        pass

@@ -156,6 +156,11 @@
             개입 없이 다음 단계 진행 (Skip)
           </button>
         </div>
+        <button id="endBtn"
+                class="w-full mt-2 py-1.5 bg-white border border-rose-300 text-rose-600
+                       text-sm font-bold rounded hover:bg-rose-50 disabled:opacity-50">
+          ⏹ 여기서 토론 종료
+        </button>
       </div>
     </section>
   </main>
@@ -197,6 +202,7 @@ let lastCompletedPhase = null;
 let wsReconnectAttempts = 0;   // WebSocket 지수 백오프 재연결 시도 횟수
 let wsReconnectTimer = null;   // 예약된 재연결 타이머 핸들
 let usageTotal = 0;            // 누적 토큰 사용량 (에이전트 발언 기준)
+let lastConvergence = null;    // 가장 최근 단계의 합의 근접도 (0~1)
 
 // ---- DOM 핸들 --------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -385,6 +391,7 @@ function resetDiscussion() {
   agentsById = {};
   lastCompletedPhase = null;
   usageTotal = 0;
+  lastConvergence = null;
   updateUsagePill();
   timelineEl.innerHTML =
     '<div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">'
@@ -563,6 +570,7 @@ function finalizeTurn(turn) {
 
 function renderSummary(phase, summary, agreement) {
   if (summary) {
+    lastConvergence = summary.convergence_score;
     const body = ensurePhaseSection(phase);
     const pct = Math.round((summary.convergence_score || 0) * 100);
     const conflicts = (summary.key_conflicts || []).map(escapeHtml).join(' · ');
@@ -934,8 +942,20 @@ function restoreManualPanels(state) {
 function onAwaitingUser(completedPhase) {
   lastCompletedPhase = completedPhase;
   setStatus('⏸ ' + phaseLabel(completedPhase) + ' 종료 — 유저 개입 대기', 'waiting');
-  $('interventionLabel').textContent =
-    '⏸ ' + phaseLabel(completedPhase) + ' 종료 — 다음 단계 진입 전 개입할 수 있습니다';
+  let label = '⏸ ' + phaseLabel(completedPhase)
+            + ' 종료 — 다음 단계 진입 전 개입할 수 있습니다';
+  // 합의 근접도로 다음 행동을 권고한다 (조기 종료 / 계속 진행).
+  if (lastConvergence != null) {
+    const pct = Math.round(lastConvergence * 100);
+    if (lastConvergence >= 0.75) {
+      label += ` · 💡 합의 근접도 ${pct}% — 충분히 수렴했습니다, '여기서 종료' 고려`;
+    } else if (lastConvergence < 0.4) {
+      label += ` · 합의 근접도 ${pct}% — 이견이 큽니다, 계속 진행 권장`;
+    } else {
+      label += ` · 합의 근접도 ${pct}%`;
+    }
+  }
+  $('interventionLabel').textContent = label;
   showInterventionBar();
 }
 
@@ -943,9 +963,25 @@ function showInterventionBar() {
   $('interventionBar').classList.remove('hidden');
   $('postBtn').disabled = false;
   $('skipBtn').disabled = false;
+  $('endBtn').disabled = false;
 }
 function hideInterventionBar() {
   $('interventionBar').classList.add('hidden');
+}
+
+// 게이트 구간에서 토론을 조기 종료한다 (남은 단계는 진행하지 않음).
+async function endDiscussion() {
+  if (!discussionId) return;
+  if (!confirm('지금 토론을 종료할까요? 남은 단계는 진행하지 않습니다.')) return;
+  $('endBtn').disabled = true;
+  try {
+    const r = await fetch(`/discussions/${discussionId}/end`, { method: 'POST' });
+    if (!r.ok) throw new Error('종료 실패: ' + r.status);
+    hideInterventionBar();
+  } catch (e) {
+    alert(e.message);
+    $('endBtn').disabled = false;
+  }
 }
 
 async function advance() {
@@ -1047,6 +1083,7 @@ $('startBtn').addEventListener('click', startDiscussion);
 $('resetBtn').addEventListener('click', resetDiscussion);
 $('postBtn').addEventListener('click', postIntervention);
 $('skipBtn').addEventListener('click', skipPhase);
+$('endBtn').addEventListener('click', endDiscussion);
 $('exportBtn').addEventListener('click', exportDiscussion);
 $('topicInput').addEventListener('input', autoGrowTopic);
 $('formatSelect').addEventListener('change', onFormatChange);
