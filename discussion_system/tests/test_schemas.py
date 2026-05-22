@@ -2,17 +2,16 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas import (
-    AgentConfig,
-    DiscussionPhase,
-    DiscussionState,
-    ModelProvider,
-)
+from app.schemas import AgentConfig, DiscussionState, ModelProvider
 
 
 def _agent(model="gpt-4o-mini", provider=None, agent_id="a", name="A"):
     return AgentConfig(agent_id=agent_id, name=name, model=model,
                        persona_prompt="p", provider=provider)
+
+
+def _two_agents():
+    return [_agent(agent_id="a1"), _agent("claude-x", agent_id="a2")]
 
 
 @pytest.mark.parametrize("model,expected", [
@@ -62,27 +61,19 @@ def test_discussion_requires_two_agents():
 
 
 def test_discussion_defaults():
-    s = DiscussionState(discussion_id="d", topic="t",
-                        agents=[_agent(agent_id="a1"),
-                                _agent("claude-x", agent_id="a2")])
+    s = DiscussionState(discussion_id="d", topic="t", agents=_two_agents())
     assert s.status.value == "created"
-    assert s.current_phase is DiscussionPhase.IDLE
+    assert s.current_phase == "idle"        # 시작 전 예약값
+    assert s.format_id == "debate"          # 기본 형식
     assert s.version == 0
     assert s.force_consensus is False
+    assert s.phase_records == {}
     assert s.final_joint_agreement is None
 
 
-def test_record_for_phase_returns_the_phase_list():
-    s = DiscussionState(discussion_id="d", topic="t",
-                        agents=[_agent(agent_id="a1"),
-                                _agent("claude-x", agent_id="a2")])
-    assert s.record_for_phase(DiscussionPhase.PHASE_1_OPINION) is s.phase_1_opinions
-    assert s.record_for_phase(DiscussionPhase.PHASE_5_CONCLUSION) is s.phase_5_conclusions
-
-
-def test_record_for_phase_rejects_non_record_phase():
-    s = DiscussionState(discussion_id="d", topic="t",
-                        agents=[_agent(agent_id="a1"),
-                                _agent("claude-x", agent_id="a2")])
-    with pytest.raises(ValueError):
-        s.record_for_phase(DiscussionPhase.IDLE)
+def test_record_for_phase_creates_and_returns_list():
+    s = DiscussionState(discussion_id="d", topic="t", agents=_two_agents())
+    rec = s.record_for_phase("opinion")
+    assert rec == []
+    assert "opinion" in s.phase_records
+    assert s.record_for_phase("opinion") is rec   # 같은 참조를 재반환

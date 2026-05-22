@@ -24,15 +24,15 @@ from enum import Enum
 from typing import Optional
 
 from . import database
+from .formats import PHASE_COMPLETED, DiscussionFormat, get_format
 from .schemas import (
-    PHASE_SEQUENCE,
     AgentConfig,
     AgentStanceSummary,
     AgentTurn,
-    DiscussionPhase,
     DiscussionState,
     DiscussionStatus,
     ModelProvider,
+    PersonaType,
     PhaseSummary,
     UserIntervention,
     WSMessage,
@@ -46,14 +46,7 @@ BroadcastCallback = Callable[[str, WSMessage], Awaitable[None]]
 #: 토큰 콜백: 스트리밍 청크 1개를 받아 (비동기로) 처리하는 함수.
 TokenCallback = Callable[[str], Awaitable[None]]
 
-#: 순차 포스팅 단계 — 후순위 에이전트가 같은 단계의 선행 의견을 맥락으로 본다.
-#: 1단계(초기 주장)는 각 에이전트가 서로의 발제를 보지 않고 독립적으로 동시
-#: 발제해야 하므로 제외한다 — 포함하면 후순위 발제자에게 선행 발제가 새어 든다.
-_SEQUENTIAL_PHASES: frozenset[DiscussionPhase] = frozenset(
-    {DiscussionPhase.PHASE_2_CRITIQUE}
-)
-
-#: 합의안 합성 발언에 쓰는 가상 발화자 ID (5단계 force_consensus=True).
+#: 합의안 합성 발언에 쓰는 가상 발화자 ID (마지막 단계 force_consensus=True).
 CONSENSUS_SPEAKER_ID = "consensus"
 
 #: 낙관적 락 충돌 시 commit 재시도 횟수.
@@ -102,45 +95,8 @@ class PipelineEvent(str, Enum):
 
 
 # ===========================================================================
-# 프롬프트 상수
+# 프롬프트 상수 / 형식 헬퍼
 # ===========================================================================
-_COMMON_RULES = (
-    "너는 '{topic}' 주제의 다자(多者) 구조화 토론에 참여하는 토론자다.\n"
-    "토론은 5단계(① 초기주장 → ② 상호비판 → ③ 반론·방어 → ④ 입장수정 "
-    "→ ⑤ 최종결론)로 진행된다.\n"
-    "[공통 규칙]\n"
-    "- 한국어로, 핵심 위주로 간결하게(6~8문장 이내) 작성한다.\n"
-    "- 다른 참가자를 이름으로 직접 지칭하며 구체적으로 논평한다.\n"
-    "- '참가자 H' 로 표기된 발언은 토론을 지켜보는 인간 진행자의 개입이다. "
-    "그 지시는 최우선으로 반영한다.\n"
-    "- '[시스템 경고: ...]' 로 표기된 발언은 해당 에이전트의 응답 생성 실패를 "
-    "뜻한다. 그 내용에 의존하거나 인용하지 말고 토론을 정상 진행한다."
-)
-
-_PHASE_INSTRUCTIONS: dict[DiscussionPhase, str] = {
-    DiscussionPhase.PHASE_1_OPINION: (
-        "[1단계 · 초기주장] 주제에 대한 너의 입장과 이를 뒷받침하는 핵심 논거 "
-        "2~3가지를 명확히 제시하라."
-    ),
-    DiscussionPhase.PHASE_2_CRITIQUE: (
-        "[2단계 · 상호비판] 다른 참가자들의 주장에서 가장 약한 지점을 찾아 "
-        "근거를 들어 비판적으로 검토하라."
-    ),
-    DiscussionPhase.PHASE_3_REBUTTAL: (
-        "[3단계 · 반론·방어] 너의 주장에 제기된 비판을 직접 거론하며 반론하고, "
-        "필요하면 논거를 보강해 입장을 방어하라."
-    ),
-    DiscussionPhase.PHASE_4_REVISION: (
-        "[4단계 · 입장수정] 지금까지의 토론을 반영하여 너의 입장을 갱신하라. "
-        "바뀐 부분과 그대로 유지하는 부분을 구분해 밝혀라."
-    ),
-    DiscussionPhase.PHASE_5_CONCLUSION: (
-        "[5단계 · 최종결론] 다른 참가자들의 4단계 입장을 검토하고, 너의 최종 "
-        "입장과 끝내 좁혀지지 않은 핵심 차이점을 '이견 일람표'(쟁점 | 나의 입장 "
-        "| 상대 입장 형식의 표)로 정리하라."
-    ),
-}
-
 #: 순차 포스팅 단계에서 후순위 에이전트에게 동적 삽입하는 중복 회피 개정 지침.
 _SEQUENTIAL_REVISION_HINT = (
     "[개정 지침] 위 '이번 단계 선행 의견'을 너의 초안과 비교하라. 중복되는 "
@@ -148,20 +104,19 @@ _SEQUENTIAL_REVISION_HINT = (
     "최종 포스팅하라."
 )
 
-#: 단계별 사람이 읽기 좋은 라벨 (맥락 렌더링용).
-_PHASE_LABELS: dict[DiscussionPhase, str] = {
-    DiscussionPhase.PHASE_1_OPINION: "1단계 · 초기주장",
-    DiscussionPhase.PHASE_2_CRITIQUE: "2단계 · 상호비판",
-    DiscussionPhase.PHASE_3_REBUTTAL: "3단계 · 반론·방어",
-    DiscussionPhase.PHASE_4_REVISION: "4단계 · 입장수정",
-    DiscussionPhase.PHASE_5_CONCLUSION: "5단계 · 최종결론",
+#: persona_type 을 프롬프트에 반영하는 역할 지침. NEUTRAL·레거시 역할은 힌트 없음.
+_PERSONA_ROLE_HINTS: dict[PersonaType, str] = {
+    PersonaType.IDEATOR: "이 세션에서 너는 새로운 아이디어를 적극적으로 발산하는 역할이다.",
+    PersonaType.BUILDER: "이 세션에서 너는 다른 사람의 아이디어에 살을 붙여 키우는 역할이다.",
+    PersonaType.CRITIC: "이 세션에서 너는 허점과 약점을 건설적으로 짚는 역할이다.",
+    PersonaType.SYNTHESIZER: "이 세션에서 너는 흩어진 의견을 통합하고 정리하는 역할이다.",
+    PersonaType.PRAGMATIST: "이 세션에서 너는 실행 가능성과 현실 제약을 따지는 역할이다.",
 }
 
 
-def _next_phase(phase: DiscussionPhase) -> Optional[DiscussionPhase]:
-    """다음 단계를 반환한다. 마지막(5)단계이면 None."""
-    idx = PHASE_SEQUENCE.index(phase)
-    return PHASE_SEQUENCE[idx + 1] if idx + 1 < len(PHASE_SEQUENCE) else None
+def _format_of(state: DiscussionState) -> DiscussionFormat:
+    """토론 상태에 지정된 형식을 반환한다 (미지의 id 면 기본 형식)."""
+    return get_format(state.format_id)
 
 
 # ===========================================================================
@@ -338,7 +293,7 @@ def _llm_agent(state: DiscussionState) -> AgentConfig:
 
 
 def _failure_turn(
-    agent: AgentConfig, phase: DiscussionPhase, exc: BaseException
+    agent: AgentConfig, phase: str, exc: BaseException
 ) -> AgentTurn:
     """실패한 에이전트의 발언칸에 적재할 시스템 경고 턴 (우아한 부분 실패 수용)."""
     return AgentTurn(
@@ -350,11 +305,13 @@ def _failure_turn(
 
 
 def _render_phase_summary(
-    state: DiscussionState, phase: DiscussionPhase, summary: PhaseSummary
+    state: DiscussionState, phase: str, summary: PhaseSummary
 ) -> str:
     """단계 요약 메트릭스(LTM)를 경량 텍스트로 렌더링한다."""
     name_of = {a.agent_id: a.name for a in state.agents}
-    lines = [f"== {_PHASE_LABELS[phase]} [요약 메트릭스 · LTM] =="]
+    spec = _format_of(state).phase(phase)
+    label = spec.label if spec else phase
+    lines = [f"== {label} [요약 메트릭스 · LTM] =="]
     for st in summary.agent_summaries:
         speaker = name_of.get(st.agent_id, st.agent_id)
         parts: list[str] = []
@@ -373,17 +330,19 @@ def _render_phase_summary(
 
 def _render_history(
     state: DiscussionState,
-    current_phase: DiscussionPhase,
+    current_phase: str,
     prior_turns: list[AgentTurn],
     force_full: bool = False,
 ) -> str:
     """이전 단계 발언 + 유저 개입 + (순차) 선행 의견을 텍스트로 렌더링한다.
 
-    콘텍스트 압축(LTM): 3단계 이후이면 1·2단계 원본 로그 대신 ``phase_summaries``
-    의 요약 메트릭스를 경량 주입한다. ``force_full=True`` 이면 압축을 끈다.
+    콘텍스트 압축(LTM): 최근 2개 단계를 제외한 더 오래된 단계는 원본 로그 대신
+    ``phase_summaries`` 의 요약 메트릭스를 경량 주입한다. ``force_full=True`` 이면
+    압축을 끈다.
     """
     name_of = {a.agent_id: a.name for a in state.agents}
     summary_of = {s.phase: s for s in state.phase_summaries}
+    fmt = _format_of(state)
     lines: list[str] = []
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
@@ -391,22 +350,25 @@ def _render_history(
         lines.append("== 진행자 사전 지시 ==")
         lines.extend(f"[참가자 H] {iv.message}" for iv in pre)
 
-    current_idx = PHASE_SEQUENCE.index(current_phase)
-    use_ltm = current_idx >= 2 and not force_full
-    for past in PHASE_SEQUENCE[:current_idx]:
-        past_idx = PHASE_SEQUENCE.index(past)
-        if use_ltm and past_idx <= 1 and past in summary_of:
-            lines.append(_render_phase_summary(state, past, summary_of[past]))
+    current_idx = fmt.phase_index(current_phase)
+    if current_idx < 0:
+        current_idx = len(fmt.phases)   # 'completed' 등 — 모든 단계가 과거
+    for past_idx, spec in enumerate(fmt.phases[:current_idx]):
+        is_recent = past_idx >= current_idx - 2   # 최근 2개 단계는 원본 유지
+        if not force_full and not is_recent and spec.id in summary_of:
+            lines.append(
+                _render_phase_summary(state, spec.id, summary_of[spec.id]))
         else:
-            turns = state.record_for_phase(past)
+            turns = state.record_for_phase(spec.id)
             if turns:
-                lines.append(f"== {_PHASE_LABELS[past]} ==")
+                lines.append(f"== {spec.label} ==")
                 for turn in turns:
                     speaker = name_of.get(turn.agent_id, turn.agent_id)
                     lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions if iv.after_phase is past]
+        after = [iv for iv in state.user_interventions
+                 if iv.after_phase == spec.id]
         if after:
-            lines.append(f"-- {_PHASE_LABELS[past]} 이후 진행자 개입 --")
+            lines.append(f"-- {spec.label} 이후 진행자 개입 --")
             lines.extend(f"[참가자 H] {iv.message}" for iv in after)
 
     if prior_turns:
@@ -419,22 +381,24 @@ def _render_history(
 
 def _render_delta(
     state: DiscussionState,
-    current_phase: DiscussionPhase,
+    current_phase: str,
     prior_turns: list[AgentTurn],
 ) -> str:
     """직전 단계 발언 + 그 직후 진행자 개입 + (순차) 이번 단계 선행 의견만."""
     name_of = {a.agent_id: a.name for a in state.agents}
+    fmt = _format_of(state)
     lines: list[str] = []
-    current_idx = PHASE_SEQUENCE.index(current_phase)
+    current_idx = fmt.phase_index(current_phase)
     if current_idx >= 1:
-        prev = PHASE_SEQUENCE[current_idx - 1]
-        turns = state.record_for_phase(prev)
+        prev = fmt.phases[current_idx - 1]
+        turns = state.record_for_phase(prev.id)
         if turns:
-            lines.append(f"== 직전 단계({_PHASE_LABELS[prev]}) 신규 발언 ==")
+            lines.append(f"== 직전 단계({prev.label}) 신규 발언 ==")
             for turn in turns:
                 speaker = name_of.get(turn.agent_id, turn.agent_id)
                 lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions if iv.after_phase is prev]
+        after = [iv for iv in state.user_interventions
+                 if iv.after_phase == prev.id]
         if after:
             lines.append("-- 직후 진행자 개입 --")
             lines.extend(f"[참가자 H] {iv.message}" for iv in after)
@@ -449,17 +413,22 @@ def _render_delta(
 def _build_prompt(
     state: DiscussionState,
     agent: AgentConfig,
-    phase: DiscussionPhase,
+    phase: str,
     prior_turns: list[AgentTurn],
     force_full: bool = False,
 ) -> tuple[str, str]:
     """[공통규칙]+[페르소나] -> system, [맥락]+[단계지침] -> user 로 조립한다."""
+    fmt = _format_of(state)
+    spec = fmt.phase(phase)
     system = (
-        _COMMON_RULES.format(topic=state.topic)
+        fmt.common_rules.format(topic=state.topic)
         + f"\n\n[너의 페르소나]\n{agent.persona_prompt}"
     )
-    instruction = _PHASE_INSTRUCTIONS[phase]
-    if phase in _SEQUENTIAL_PHASES and prior_turns:
+    role_hint = _PERSONA_ROLE_HINTS.get(agent.persona_type)
+    if role_hint:
+        system += f"\n\n[너의 역할]\n{role_hint}"
+    instruction = spec.instruction if spec else f"[{phase}] 단계 작업을 수행하라."
+    if spec and spec.sequential and prior_turns:
         instruction = f"{instruction}\n\n{_SEQUENTIAL_REVISION_HINT}"
     history = _render_history(state, phase, prior_turns, force_full=force_full)
     user_sections = [f"[토론 주제]\n{state.topic}"]
@@ -472,7 +441,7 @@ def _build_prompt(
 def generate_deep_copy(
     state: DiscussionState,
     agent_id: str,
-    phase: DiscussionPhase,
+    phase: str,
     prior_turns: Optional[list[AgentTurn]] = None,
 ) -> str:
     """딥 카피: 시스템 프롬프트 + 전체 원본 이력 전문 — 새 LLM 세션 붙여넣기용."""
@@ -492,15 +461,16 @@ def generate_deep_copy(
 def generate_general_copy(
     state: DiscussionState,
     agent_id: str,
-    phase: DiscussionPhase,
+    phase: str,
     prior_turns: Optional[list[AgentTurn]] = None,
 ) -> str:
     """일반 복사: 압축 메모리·시스템 프롬프트 제외, 직전 단계 신규 델타 맥락만."""
     agent = _agent_by_id(state, agent_id)
     prior = list(prior_turns or [])
+    spec = _format_of(state).phase(phase)
     delta = _render_delta(state, phase, prior)
-    instruction = _PHASE_INSTRUCTIONS[phase]
-    if phase in _SEQUENTIAL_PHASES and prior:
+    instruction = spec.instruction if spec else f"[{phase}] 단계 작업을 수행하라."
+    if spec and spec.sequential and prior:
         instruction = f"{instruction}\n\n{_SEQUENTIAL_REVISION_HINT}"
     sections = ["[복사 유형] 일반 복사 — 진행 중인 대화 세션에 이어 붙이세요."]
     if delta:
@@ -563,15 +533,15 @@ class Orchestrator:
             raise DiscussionError(f"토론 {discussion_id} 를 찾을 수 없습니다.")
 
         if event is PipelineEvent.START:
-            await self._run_phase(discussion_id, PHASE_SEQUENCE[0])
+            await self._run_phase(discussion_id, _format_of(state).first_phase.id)
         elif event is PipelineEvent.ADVANCE:
             if state.status is not DiscussionStatus.WAITING_FOR_USER:
                 raise InvalidStateTransition(
                     f"advance 는 WAITING_FOR_USER 에서만 가능 (현재 {state.status.value})"
                 )
-            nxt = _next_phase(state.current_phase)
+            nxt = _format_of(state).next_phase(state.current_phase)
             if nxt is not None:
-                await self._run_phase(discussion_id, nxt)
+                await self._run_phase(discussion_id, nxt.id)
         elif event is PipelineEvent.MANUAL_RESPONSE:
             await self._on_manual_response(state, payload or {})
         elif event is PipelineEvent.RECOVER:
@@ -600,7 +570,7 @@ class Orchestrator:
         for s in running:
             logger.info(
                 "크래시 복구: %s — RUNNING(%s) 단계 멱등 재기동",
-                s.discussion_id, s.current_phase.value,
+                s.discussion_id, s.current_phase,
             )
             self.trigger(s.discussion_id, PipelineEvent.RECOVER)
         return {"running_recovered": len(running), "pending_preserved": len(pending)}
@@ -645,13 +615,14 @@ class Orchestrator:
                     or state.status is not DiscussionStatus.PENDING_MANUAL_INPUT):
                 return
             phase = state.current_phase
-            if phase not in PHASE_SEQUENCE:
+            spec = _format_of(state).phase(phase)
+            if spec is None:
                 return
             record = state.record_for_phase(phase)
             posted = {t.agent_id for t in record}
             # posted 는 이미 발언한 에이전트 판별용(항상 전체), prior 는 복사본에
             # 넣을 맥락 — 동시 단계에서는 서로의 발제가 새지 않도록 비운다.
-            prior = list(record) if phase in _SEQUENTIAL_PHASES else []
+            prior = list(record) if spec.sequential else []
             for agent in state.agents:
                 if (agent.provider is not ModelProvider.MANUAL
                         or agent.agent_id in posted):
@@ -660,7 +631,7 @@ class Orchestrator:
                     type=WSMessageType.MANUAL_INPUT_REQUIRED,
                     payload={
                         "agent_id": agent.agent_id,
-                        "phase": phase.value,
+                        "phase": phase,
                         "deep_copy": generate_deep_copy(
                             state, agent.agent_id, phase, prior),
                         "general_copy": generate_general_copy(
@@ -679,12 +650,13 @@ class Orchestrator:
         if state.status is not DiscussionStatus.RUNNING:
             return  # PENDING 등은 DB 상태 그대로가 정상 — 손대지 않는다.
         phase = state.current_phase
-        if phase not in PHASE_SEQUENCE:
+        if _format_of(state).phase(phase) is None:
             return
         # 멱등 재기동: 현재 단계의 부분 발언 기록·요약을 비우고 처음부터 재실행.
         def reset(s: DiscussionState) -> None:
             s.record_for_phase(phase).clear()
-            s.phase_summaries[:] = [p for p in s.phase_summaries if p.phase is not phase]
+            s.phase_summaries[:] = [p for p in s.phase_summaries
+                                    if p.phase != phase]
             s.touch()
 
         await self._commit(state.discussion_id, reset)
@@ -695,7 +667,7 @@ class Orchestrator:
     ) -> None:
         """수동 에이전트 응답 주입 — 턴 기록 후 단계 진행을 재개한다."""
         agent_id = str(payload.get("agent_id", ""))
-        phase = DiscussionPhase(payload["phase"])
+        phase = str(payload["phase"])
         content = str(payload.get("content", "")).strip()
 
         if state.status is not DiscussionStatus.PENDING_MANUAL_INPUT:
@@ -705,9 +677,9 @@ class Orchestrator:
         agent = _agent_by_id(state, agent_id)
         if agent.provider is not ModelProvider.MANUAL:
             raise InvalidStateTransition(f"에이전트 {agent_id} 는 수동 에이전트가 아닙니다.")
-        if phase is not state.current_phase:
+        if phase != state.current_phase:
             raise InvalidStateTransition(
-                f"수동 입력 단계({phase.value})가 현재 단계와 다릅니다."
+                f"수동 입력 단계({phase})가 현재 단계와 다릅니다."
             )
         if any(t.agent_id == agent_id for t in state.record_for_phase(phase)):
             raise InvalidStateTransition(f"에이전트 {agent_id} 는 이미 응답했습니다.")
@@ -726,15 +698,15 @@ class Orchestrator:
         await self._advance_phase_progress(state.discussion_id, phase)
 
     # ----- 단계 실행 -----
-    async def _run_phase(self, discussion_id: str, phase: DiscussionPhase) -> None:
+    async def _run_phase(self, discussion_id: str, phase: str) -> None:
         """단계 진입 — status RUNNING 마킹 후 진행 가능한 데까지 수행한다."""
         await self._commit(discussion_id, lambda s: _mark_phase_start(s, phase))
         await self._emit(discussion_id, WSMessageType.PHASE_STARTED,
-                         {"phase": phase.value})
+                         {"phase": phase})
         await self._advance_phase_progress(discussion_id, phase)
 
     async def _advance_phase_progress(
-        self, discussion_id: str, phase: DiscussionPhase
+        self, discussion_id: str, phase: str
     ) -> None:
         """현재 단계를 '인간 입력 없이 가능한 데까지' 진행한다.
 
@@ -746,8 +718,11 @@ class Orchestrator:
         if state is None:
             return
 
-        if phase is DiscussionPhase.PHASE_5_CONCLUSION and state.force_consensus:
-            await self._run_consensus(discussion_id)
+        fmt = _format_of(state)
+        spec = fmt.phase(phase)
+        if (spec is not None and fmt.is_last_phase(phase)
+                and fmt.supports_consensus and state.force_consensus):
+            await self._run_consensus(discussion_id, phase)
             return
 
         record = state.record_for_phase(phase)
@@ -757,7 +732,7 @@ class Orchestrator:
             await self._finish_phase(discussion_id, phase)
             return
 
-        if phase in _SEQUENTIAL_PHASES:
+        if spec is not None and spec.sequential:
             nxt = pending[0]
             if nxt.provider is ModelProvider.MANUAL:
                 await self._enter_pending(discussion_id, phase, [nxt])
@@ -787,7 +762,7 @@ class Orchestrator:
             await self._finish_phase(discussion_id, phase)
 
     async def _enter_pending(
-        self, discussion_id: str, phase: DiscussionPhase,
+        self, discussion_id: str, phase: str,
         manual_agents: list[AgentConfig],
     ) -> None:
         """수동 에이전트 차례 — 복사 페이로드를 UI 로 보내고 PENDING 으로 마킹.
@@ -798,11 +773,12 @@ class Orchestrator:
         state = await self._load(discussion_id)
         if state is None:
             return
-        # 같은 단계의 선행 의견은 '순차' 단계에서만 맥락으로 넣는다. 동시 단계
-        # (1·3·4·5단계)는 서로의 발제를 보면 안 되므로 빈 맥락으로 복사본을 만든다.
+        # 같은 단계의 선행 의견은 '순차' 단계에서만 맥락으로 넣는다. 동시 단계는
+        # 서로의 발제를 보면 안 되므로 빈 맥락으로 복사본을 만든다.
+        spec = _format_of(state).phase(phase)
         prior = (
             list(state.record_for_phase(phase))
-            if phase in _SEQUENTIAL_PHASES else []
+            if spec is not None and spec.sequential else []
         )
         for agent in manual_agents:
             deep = generate_deep_copy(state, agent.agent_id, phase, prior)
@@ -810,7 +786,7 @@ class Orchestrator:
             await self._emit(
                 discussion_id, WSMessageType.MANUAL_INPUT_REQUIRED,
                 {
-                    "agent_id": agent.agent_id, "phase": phase.value,
+                    "agent_id": agent.agent_id, "phase": phase,
                     "deep_copy": deep, "general_copy": general,
                 },
             )
@@ -820,23 +796,23 @@ class Orchestrator:
         )
         logger.info(
             "토론 %s — 수동 입력 대기 진입 (%s, %d명) — 메모리 반환",
-            discussion_id, phase.value, len(manual_agents),
+            discussion_id, phase, len(manual_agents),
         )
 
-    async def _finish_phase(self, discussion_id: str, phase: DiscussionPhase) -> None:
+    async def _finish_phase(self, discussion_id: str, phase: str) -> None:
         """단계 종료 — 요약 생성 -> 게이트(WAITING) 또는 토론 종료(COMPLETED)."""
         state = await self._load(discussion_id)
         if state is None:
             return
         summary = await self._summarize_phase(state, phase,
                                               list(state.record_for_phase(phase)))
-        nxt = _next_phase(phase)
+        nxt = _format_of(state).next_phase(phase)
 
         def mutate(s: DiscussionState) -> None:
-            if not any(ps.phase is phase for ps in s.phase_summaries):
+            if not any(ps.phase == phase for ps in s.phase_summaries):
                 s.phase_summaries.append(summary)
             if nxt is None:
-                s.current_phase = DiscussionPhase.COMPLETED
+                s.current_phase = PHASE_COMPLETED
                 s.status = DiscussionStatus.COMPLETED
             else:
                 s.status = DiscussionStatus.WAITING_FOR_USER
@@ -844,7 +820,7 @@ class Orchestrator:
 
         state = await self._commit(discussion_id, mutate)
         payload: dict[str, object] = {
-            "phase": phase.value, "summary": summary.model_dump(mode="json"),
+            "phase": phase, "summary": summary.model_dump(mode="json"),
         }
         if state.final_joint_agreement is not None:
             payload["final_joint_agreement"] = state.final_joint_agreement
@@ -857,10 +833,10 @@ class Orchestrator:
             )
         else:
             await self._emit(discussion_id, WSMessageType.AWAITING_USER,
-                             {"completed_phase": phase.value})
+                             {"completed_phase": phase})
 
-    async def _run_consensus(self, discussion_id: str) -> None:
-        """5단계 force_consensus=True — 단일 합의안 문서를 합성한다."""
+    async def _run_consensus(self, discussion_id: str, phase: str) -> None:
+        """마지막 단계 force_consensus=True — 단일 합의안 문서를 합성한다."""
         state = await self._load(discussion_id)
         if state is None:
             return
@@ -872,11 +848,11 @@ class Orchestrator:
         await self._commit(
             discussion_id, lambda s: _set_agreement(s, agreement)
         )
-        await self._finish_phase(discussion_id, DiscussionPhase.PHASE_5_CONCLUSION)
+        await self._finish_phase(discussion_id, phase)
 
     # ----- 에이전트 호출 -----
     async def _do_api_turn(
-        self, state: DiscussionState, phase: DiscussionPhase,
+        self, state: DiscussionState, phase: str,
         agent: AgentConfig, prior_turns: list[AgentTurn],
     ) -> AgentTurn:
         """한 API 에이전트의 턴 — 스트리밍 LLM 호출. 실패는 시스템 경고 턴으로."""
@@ -886,7 +862,7 @@ class Orchestrator:
             async def on_token(token: str) -> None:
                 await self._emit(
                     state.discussion_id, WSMessageType.TOKEN_STREAM,
-                    {"agent_id": agent.agent_id, "phase": phase.value,
+                    {"agent_id": agent.agent_id, "phase": phase,
                      "token": token},
                 )
 
@@ -903,7 +879,7 @@ class Orchestrator:
             return _failure_turn(agent, phase, exc)
 
     async def _gather_api_turns(
-        self, state: DiscussionState, phase: DiscussionPhase,
+        self, state: DiscussionState, phase: str,
         agents: list[AgentConfig],
     ) -> list[AgentTurn]:
         """동시 단계 — 여러 API 에이전트를 asyncio.gather 로 병렬 호출한다."""
@@ -978,8 +954,9 @@ class Orchestrator:
         return refined.strip()
 
     async def _synthesize(self, state: DiscussionState) -> str:
-        """4단계까지를 종합해 단일 최종 합의안 문서를 생성한다(스트리밍)."""
-        history = _render_history(state, DiscussionPhase.PHASE_5_CONCLUSION, [])
+        """직전 단계까지를 종합해 단일 최종 합의안 문서를 생성한다(스트리밍)."""
+        last_phase = _format_of(state).phases[-1].id
+        history = _render_history(state, last_phase, [])
         system = (
             "너는 다자 토론의 중립적 합의 조정자다. 특정 참가자 편을 들지 않고, "
             "모든 참가자가 받아들일 수 있는 공통분모를 찾는다."
@@ -996,28 +973,30 @@ class Orchestrator:
         async def on_token(token: str) -> None:
             await self._emit(did, WSMessageType.TOKEN_STREAM,
                              {"agent_id": CONSENSUS_SPEAKER_ID,
-                              "phase": DiscussionPhase.PHASE_5_CONCLUSION.value,
+                              "phase": last_phase,
                               "token": token})
 
         return await self._invoke_agent(_llm_agent(state), system, user, on_token)
 
     async def _summarize_phase(
-        self, state: DiscussionState, phase: DiscussionPhase,
+        self, state: DiscussionState, phase: str,
         turns: list[AgentTurn],
     ) -> PhaseSummary:
         """단계 요약 메트릭스를 생성한다. 실패해도 파이프라인을 멈추지 않는다."""
-        if phase is DiscussionPhase.PHASE_5_CONCLUSION and state.force_consensus:
+        fmt = _format_of(state)
+        if (fmt.is_last_phase(phase) and fmt.supports_consensus
+                and state.force_consensus):
             return PhaseSummary(phase=phase, convergence_score=1.0)
         if not turns:
             return PhaseSummary(phase=phase)
         try:
             return await self._llm_summarize(state, phase, turns)
         except Exception as exc:  # noqa: BLE001 - 요약 실패는 비치명적
-            logger.warning("단계 %s 요약 생성 실패: %r", phase.value, exc)
+            logger.warning("단계 %s 요약 생성 실패: %r", phase, exc)
             return PhaseSummary(phase=phase, key_conflicts=[f"[요약 생성 실패: {exc}]"])
 
     async def _llm_summarize(
-        self, state: DiscussionState, phase: DiscussionPhase,
+        self, state: DiscussionState, phase: str,
         turns: list[AgentTurn],
     ) -> PhaseSummary:
         """LLM 에 단계 발언을 분석시켜 PhaseSummary(주장 메트릭스)를 구성한다."""
@@ -1027,11 +1006,13 @@ class Orchestrator:
             for t in turns
         )
         agent_ids = [a.agent_id for a in state.agents]
+        spec = _format_of(state).phase(phase)
+        label = spec.label if spec else phase
         system = (
             "너는 토론 분석가다. 요청한 JSON 객체만 출력하고 다른 설명은 하지 않는다."
         )
         user = (
-            f"다음은 '{_PHASE_LABELS.get(phase, phase.value)}' 단계의 발언이다.\n"
+            f"다음은 '{label}' 단계의 발언이다.\n"
             f"{transcript}\n\n"
             "아래 JSON 스키마에 맞춰 정확히 응답하라:\n"
             '{"agent_summaries": [{"agent_id": "...", "initial_claim": "...", '
@@ -1110,7 +1091,7 @@ class Orchestrator:
 # ===========================================================================
 # 멱등 mutate 함수 — _commit 에 전달 (재시도 시 신선한 state 에 재적용됨)
 # ===========================================================================
-def _mark_phase_start(state: DiscussionState, phase: DiscussionPhase) -> None:
+def _mark_phase_start(state: DiscussionState, phase: str) -> None:
     """단계 진입 마킹. 멱등."""
     state.current_phase = phase
     state.status = DiscussionStatus.RUNNING
@@ -1118,7 +1099,7 @@ def _mark_phase_start(state: DiscussionState, phase: DiscussionPhase) -> None:
 
 
 def _record_turns(
-    state: DiscussionState, phase: DiscussionPhase, turns: list[AgentTurn]
+    state: DiscussionState, phase: str, turns: list[AgentTurn]
 ) -> None:
     """발언 턴을 단계 기록에 추가한다. 멱등 — 이미 있는 agent_id 는 건너뛴다."""
     record = state.record_for_phase(phase)

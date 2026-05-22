@@ -14,14 +14,11 @@ from .schemas import DiscussionState
 
 Base = declarative_base()
 
-#: DiscussionState 의 list 계열 필드 — JSON 컬럼으로 직렬화 저장한다.
+#: DiscussionState 의 컬렉션 필드 — JSON 컬럼으로 직렬화 저장한다.
+#: phase_records 는 dict(단계 id -> 발언 목록), 나머지는 list.
 _JSON_FIELDS = (
     "agents",
-    "phase_1_opinions",
-    "phase_2_critiques",
-    "phase_3_rebuttals",
-    "phase_4_revisions",
-    "phase_5_conclusions",
+    "phase_records",
     "phase_summaries",
     "user_interventions",
 )
@@ -30,6 +27,7 @@ _JSON_FIELDS = (
 _SCALAR_FIELDS = (
     "discussion_id",
     "topic",
+    "format_id",
     "status",
     "current_phase",
     "force_consensus",
@@ -49,6 +47,7 @@ class DiscussionRow(Base):
     # --- 스칼라 컬럼 (조회 / 필터용) ---
     discussion_id = Column(String, primary_key=True)
     topic = Column(String, nullable=False)
+    format_id = Column(String, nullable=False, default="debate")
     status = Column(String, nullable=False, index=True)
     current_phase = Column(String, nullable=False)
     force_consensus = Column(Boolean, nullable=False, default=False)
@@ -60,11 +59,7 @@ class DiscussionRow(Base):
 
     # --- JSON 컬럼 (복잡한 딕셔너리/리스트 필드 직렬화) ---
     agents = Column(JSON, nullable=False, default=list)
-    phase_1_opinions = Column(JSON, nullable=False, default=list)
-    phase_2_critiques = Column(JSON, nullable=False, default=list)
-    phase_3_rebuttals = Column(JSON, nullable=False, default=list)
-    phase_4_revisions = Column(JSON, nullable=False, default=list)
-    phase_5_conclusions = Column(JSON, nullable=False, default=list)
+    phase_records = Column(JSON, nullable=False, default=dict)
     phase_summaries = Column(JSON, nullable=False, default=list)
     user_interventions = Column(JSON, nullable=False, default=list)
 
@@ -84,5 +79,8 @@ def row_to_state(row: DiscussionRow) -> DiscussionState:
     """DiscussionRow -> DiscussionState (Pydantic 재검증)."""
     data: dict = {field: getattr(row, field) for field in _SCALAR_FIELDS}
     for field in _JSON_FIELDS:
-        data[field] = getattr(row, field) or []
+        value = getattr(row, field)
+        if value is None:
+            value = {} if field == "phase_records" else []
+        data[field] = value
     return DiscussionState.model_validate(data)

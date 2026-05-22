@@ -56,7 +56,7 @@ async def test_phase1_manual_copy_has_no_peer_posting(
     orchestrator.broadcasts.clear()
     await orchestrator.process_event(
         "man", PipelineEvent.MANUAL_RESPONSE,
-        {"agent_id": "m1", "phase": "phase_1_opinion", "content": secret})
+        {"agent_id": "m1", "phase": "opinion", "content": secret})
 
     m2 = [m for _, m in orchestrator.broadcasts
           if m.type.value == "manual_input_required"

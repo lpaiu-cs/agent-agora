@@ -1,9 +1,9 @@
-"""manager.py 순수 헬퍼 — 환경변수 파싱, 시스템 LLM 에이전트 선택, 단계 전이."""
+"""manager.py 순수 헬퍼 — 환경변수 파싱, 시스템 LLM 에이전트 선택."""
 import pytest
 
 from app import manager
-from app.manager import _llm_agent, _next_phase, _positive_int_env
-from app.schemas import AgentConfig, DiscussionPhase, DiscussionState, ModelProvider
+from app.manager import _llm_agent, _positive_int_env
+from app.schemas import AgentConfig, DiscussionState, ModelProvider
 
 
 def _agent(agent_id, provider):
@@ -28,11 +28,6 @@ def test_positive_int_env(monkeypatch, raw, expected):
     assert _positive_int_env("AGORA_TEST_VAR", 8) == expected
 
 
-def test_only_phase_2_is_sequential():
-    # 회귀 방지: 1단계는 동시 발제 단계 — 순차 집합엔 2단계만 있어야 한다.
-    assert manager._SEQUENTIAL_PHASES == frozenset({DiscussionPhase.PHASE_2_CRITIQUE})
-
-
 def test_llm_agent_picks_first_non_manual():
     state = _state(ModelProvider.MANUAL, ModelProvider.OPENAI,
                    ModelProvider.ANTHROPIC)
@@ -50,11 +45,3 @@ def test_llm_agent_falls_back_when_all_manual():
 
 def test_fallback_model_default_is_gpt_4o_mini():
     assert manager._FALLBACK_LLM_MODEL == "gpt-4o-mini"
-
-
-def test_next_phase_sequence():
-    assert _next_phase(DiscussionPhase.PHASE_1_OPINION) is \
-        DiscussionPhase.PHASE_2_CRITIQUE
-    assert _next_phase(DiscussionPhase.PHASE_4_REVISION) is \
-        DiscussionPhase.PHASE_5_CONCLUSION
-    assert _next_phase(DiscussionPhase.PHASE_5_CONCLUSION) is None

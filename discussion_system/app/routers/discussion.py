@@ -107,6 +107,7 @@ async def create_discussion(
     state = DiscussionState(
         discussion_id=discussion_id,
         topic=req.topic,
+        format_id=req.format_id,
         agents=req.agents,
         force_consensus=req.force_consensus,
     )
@@ -174,7 +175,7 @@ async def submit_manual_response(
         )
     orchestrator.trigger(
         discussion_id, PipelineEvent.MANUAL_RESPONSE,
-        {"agent_id": req.agent_id, "phase": req.phase.value,
+        {"agent_id": req.agent_id, "phase": req.phase,
          "content": req.content},
     )
     return {"status": "manual_response_accepted", "discussion_id": discussion_id}

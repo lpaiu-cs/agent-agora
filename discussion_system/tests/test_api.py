@@ -59,7 +59,7 @@ def test_manual_response_rejects_non_pending_state(client):
     did = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]
     r = client.post(f"/discussions/{did}/manual-response", json={
-        "agent_id": "m1", "phase": "phase_1_opinion", "content": "응답"})
+        "agent_id": "m1", "phase": "opinion", "content": "응답"})
     assert r.status_code == 409
 
 
