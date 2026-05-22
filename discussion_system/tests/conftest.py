@@ -94,3 +94,28 @@ async def orchestrator(fresh_db):
     orch.broadcasts = broadcasts
     yield orch
     await pool.aclose()
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    """FastAPI TestClient — 격리 임시 DB, 백그라운드 파이프라인은 비활성.
+
+    ``Orchestrator.trigger`` 를 no-op 으로 막아 HTTP 계층(검증·상태코드·라우팅)만
+    결정론적으로 검증한다 — 파이프라인 자체의 동작은 test_orchestrator 가 맡는다.
+    lifespan 이 init_db·dispose 를 수행하므로 픽스처는 엔진 바인딩만 한다.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    url = f"sqlite+aiosqlite:///{tmp_path}/api.db"
+    engine = create_async_engine(url)
+    session_factory = async_sessionmaker(
+        engine, expire_on_commit=False, class_=AsyncSession
+    )
+    monkeypatch.setattr(database, "_engine", engine)
+    monkeypatch.setattr(database, "_Session", session_factory)
+    monkeypatch.setattr(manager.Orchestrator, "trigger",
+                        lambda self, *a, **kw: None)
+    with TestClient(app) as test_client:
+        yield test_client
