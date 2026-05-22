@@ -885,7 +885,16 @@ class Orchestrator:
             f"[이번 단계 작업]\n{instruction}\n\n"
             "[지시] 위 문답을 반영해 최종 발언을 완성하라. 발언 본문만 출력하라."
         )
-        return (await self._invoke_agent(agent, system, user)).strip()
+
+        async def on_token(token: str) -> None:
+            await self._emit(
+                state.discussion_id, WSMessageType.TOKEN_STREAM,
+                {"agent_id": review.agent_id, "phase": review.phase,
+                 "token": token},
+            )
+
+        return (await self._invoke_agent(
+            agent, system, user, on_token)).strip()
 
     # ----- 단계 실행 -----
     async def _run_phase(self, discussion_id: str, phase: str) -> None:

@@ -507,7 +507,11 @@ function ensureBubble(phase, agentId) {
 
 function appendToken(phase, agentId, token) {
   const b = ensureBubble(phase, agentId);
-  if (!b.streaming) { b.streaming = true; b.body.classList.add('streaming'); }
+  if (!b.streaming) {
+    b.streaming = true;
+    b.body.classList.add('streaming');
+    b.body.textContent = '';   // 검토 대기 등 플레이스홀더를 비우고 스트리밍 시작
+  }
   b.body.textContent += token;
   scrollTimeline();
 }
@@ -527,6 +531,16 @@ function finalizeTurn(turn) {
   if (failed) {
     b.wrap.classList.remove('bubble--' + b.ptype);
     b.wrap.classList.add('bubble--warning');
+  }
+  if (turn.metadata && turn.metadata.reviewed) {
+    const header = b.wrap.querySelector('div');
+    if (header && !header.querySelector('.reviewed-badge')) {
+      const badge = document.createElement('span');
+      badge.className = 'reviewed-badge text-[10px] px-1.5 py-0.5 rounded-full '
+                      + 'bg-violet-100 text-violet-700';
+      badge.textContent = '🔍 검토됨';
+      header.appendChild(badge);
+    }
   }
   scrollTimeline();
 }
@@ -672,7 +686,7 @@ function applyManualPayloads(panel, deepCopy, generalCopy) {
 // 타임라인 재구성 직전 — 작성 중이던 텍스트(수동 응답 초안 + 개입 코멘트)를
 // 메모리로 대피시킨다. innerHTML 초기화로 textarea DOM 이 파괴돼도 글자를 잃지 않게.
 function captureDrafts() {
-  const drafts = { manual: {}, intervention: '' };
+  const drafts = { manual: {}, intervention: '', review: '' };
   document.querySelectorAll('.manual-panel').forEach((panel) => {
     const ta = panel.querySelector('.manual-input');
     if (ta && ta.value) {
@@ -682,6 +696,8 @@ function captureDrafts() {
   });
   const iv = $('interventionInput');
   if (iv && iv.value) drafts.intervention = iv.value;
+  const rq = document.querySelector('.review-question');
+  if (rq && rq.value) drafts.review = rq.value;
   return drafts;
 }
 
@@ -697,6 +713,8 @@ function restoreDrafts(drafts) {
   });
   const iv = $('interventionInput');
   if (drafts.intervention && iv && !iv.value) iv.value = drafts.intervention;
+  const rq = document.querySelector('.review-question');
+  if (drafts.review && rq && !rq.value) rq.value = drafts.review;
 }
 
 // ---- 선택적 가로채기 검토 게이트 -------------------------------------------
@@ -789,7 +807,12 @@ function appendReviewQA(qaEl, exchange) {
 // 검토 문답 답변 수신 — 현재 검토 패널에 추가한다.
 function onReviewAnswer(exchange) {
   const panel = document.querySelector('.review-panel');
-  if (panel && exchange) appendReviewQA(panel.querySelector('.review-qa'), exchange);
+  if (panel && exchange) {
+    appendReviewQA(panel.querySelector('.review-qa'), exchange);
+    // 답변이 도착했다 — 질문·승인 버튼을 다시 연다.
+    panel.querySelector('.review-ask').disabled = false;
+    panel.querySelector('.review-approve').disabled = false;
+  }
   scrollTimeline();
 }
 
@@ -797,8 +820,11 @@ function onReviewAnswer(exchange) {
 async function askReview(panel) {
   const q = panel.querySelector('.review-question').value.trim();
   if (!q) { alert('질문을 입력하세요.'); return; }
-  const btn = panel.querySelector('.review-ask');
-  btn.disabled = true;
+  const ask = panel.querySelector('.review-ask');
+  const approve = panel.querySelector('.review-approve');
+  // 답변 도착 전까지 승인을 막는다 — '질문+승인 동시' 레이스를 차단.
+  ask.disabled = true;
+  approve.disabled = true;
   try {
     const r = await fetch(`/discussions/${discussionId}/review/question`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -806,10 +832,11 @@ async function askReview(panel) {
     });
     if (!r.ok) throw new Error('질문 전송 실패: ' + r.status);
     panel.querySelector('.review-question').value = '';
+    // 성공 시엔 review_answer 수신(onReviewAnswer)이 버튼을 다시 켠다.
   } catch (e) {
     alert(e.message);
-  } finally {
-    btn.disabled = false;
+    ask.disabled = false;
+    approve.disabled = false;
   }
 }
 
