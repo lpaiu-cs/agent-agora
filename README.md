@@ -1,7 +1,8 @@
 # Agent Agora — 다중 에이전트 LLM 토론 시스템
 
-여러 LLM 에이전트가 하나의 주제를 두고 **5단계 구조화 프로토콜**로 토론하도록
-오케스트레이션하는 FastAPI 기반 백엔드 + 단일 파일 웹 UI.
+여러 LLM 에이전트가 하나의 주제를 두고 **다단계 구조화 프로토콜**(구조화 토론·
+브레인스토밍 등 선택 가능한 형식)로 협의하도록 오케스트레이션하는 FastAPI 기반
+백엔드 + 단일 파일 웹 UI.
 
 > **릴리즈: v0.6.0-final** — 이벤트 구동형 무상태 오케스트레이션 · 완전 비동기 DB ·
 > 크래시 복구 · LLM 호출 백프레셔 · 컨테이너화 완료.
@@ -10,7 +11,7 @@
 
 ## 핵심 기능
 
-- **5단계 토론 프로토콜** — 초기 주장 → 상호 비판 → 반론·방어 → 입장 수정 → 최종 결론
+- **다중 토론 형식** — 구조화 토론(5단계)·브레인스토밍(4단계). 형식마다 단계 구성·프롬프트가 다르며 코드로 추가 가능
 - **멀티 공급자 LLM** — OpenAI · Anthropic · Ollama, 그리고 복붙 기반 `manual` 공급자
 - **토큰 단위 실시간 스트리밍** — WebSocket 으로 발언이 생성되는 과정을 그대로 전송
 - **이벤트 구동형 무상태 오케스트레이션** — 매 이벤트가 `DB 로드 → 전이 → 저장 → 종료`,
@@ -24,23 +25,37 @@
 
 ---
 
-## 5단계 토론 프로토콜
+## 토론 형식
 
-2단계(상호 비판)만 **순차 포스팅**(후순위 에이전트가 같은 단계의 선행 의견을
-맥락으로 받음)이고, 1·3·4·5단계는 **동시 호출**(`asyncio.gather`)이다. 특히
-1단계 초기 주장은 각 에이전트가 **서로의 발제를 보지 않고 독립적으로** 발제한다.
-각 단계가 끝나면 파이프라인이 게이트 락(`waiting_for_user`)되어 유저 개입을 기다린다.
+토론 진행 구조는 **형식(`DiscussionFormat`)**으로 정의된다 — 형식마다 단계 개수·
+순서·지침·순차성이 다르다. 형식은 `app/formats.py` 레지스트리에 코드로 등록되며,
+토론 생성 시 `format_id` 로 선택한다 (`GET /formats` 로 목록 조회).
 
-| 단계 | 이름 | 진행 방식 | 설명 |
-|:---:|------|:---:|------|
-| 1 | 초기 주장 (opinion)    | 동시 | 각자 **서로의 발제를 보지 않고** 독립적으로 입장·논거 제시 |
-| 2 | 상호 비판 (critique)   | 순차 | 다른 에이전트 주장의 약점을 근거를 들어 비판 |
-| 3 | 반론·방어 (rebuttal)   | 동시 | 받은 비판에 반론하고 자기 입장을 방어 |
-| 4 | 입장 수정 (revision)   | 동시 | 토론을 반영해 입장을 갱신 (변경/유지 구분) |
-| 5 | 최종 결론 (conclusion) | 동시 | 최종 입장 정리 (`force_consensus` 시 단일 합의안 도출) |
+**구조화 토론 (`debate`) — 5단계**
 
-3단계부터는 콘텍스트 압축(LTM)이 적용되어, 1·2단계 원문 대신 단계 요약
-메트릭스(`phase_summaries`)를 프롬프트에 주입한다.
+| 단계 | 진행 방식 | 설명 |
+|------|:---:|------|
+| 초기 주장 (opinion)    | 동시 | 각자 서로의 발제를 보지 않고 독립적으로 입장·논거 제시 |
+| 상호 비판 (critique)   | 순차 | 후순위 에이전트가 같은 단계 선행 비판을 맥락으로 받아 중복 회피 |
+| 반론·방어 (rebuttal)   | 동시 | 받은 비판에 반론하고 자기 입장을 방어 |
+| 입장 수정 (revision)   | 동시 | 토론을 반영해 입장을 갱신 |
+| 최종 결론 (conclusion) | 동시 | 최종 입장 정리 (`force_consensus` 시 단일 합의안 도출) |
+
+**브레인스토밍 (`brainstorm`) — 4단계**
+
+| 단계 | 진행 방식 | 설명 |
+|------|:---:|------|
+| 아이디어 발산 (diverge) | 동시 | 제약 없이 새 아이디어를 발산 |
+| 상호 확장 (expand)      | 순차 | 유망한 아이디어에 '예, 그리고'로 살을 붙여 확장 |
+| 수렴·선별 (converge)    | 동시 | 가장 가치 있는 아이디어를 선별 |
+| 실행안 (action)         | 동시 | 선별된 아이디어의 실행 단계·제약 제시 |
+
+**동시** 단계는 `asyncio.gather` 병렬 호출이며 서로의 발제를 보지 않는다.
+**순차** 단계만 후순위 에이전트가 같은 단계 선행 의견을 맥락으로 받는다. 각 단계가
+끝나면 파이프라인이 게이트 락(`waiting_for_user`)되어 유저 개입을 기다린다.
+
+오래된 단계는 콘텍스트 압축(LTM)으로 원문 대신 단계 요약 메트릭스
+(`phase_summaries`)를 프롬프트에 주입한다 — 최근 2개 단계는 원문을 유지한다.
 
 ---
 
@@ -56,6 +71,7 @@ agent-agora/
     │   ├── __init__.py       # 버전 상수
     │   ├── main.py           # FastAPI 진입점 (lifespan: DB·풀 초기화/정리)
     │   ├── schemas.py        # Pydantic v2 데이터 모델 (상태·요청·WS 메시지)
+    │   ├── formats.py        # 토론 형식 정의 (debate · brainstorm)
     │   ├── manager.py        # 이벤트 구동형 무상태 Orchestrator + LLM 연동
     │   ├── database.py       # 비동기 영속성 레이어 (저장/조회 + 낙관적 락)
     │   ├── models.py         # SQLAlchemy ORM 모델 + 상태 <-> 행 변환
@@ -63,8 +79,9 @@ agent-agora/
     │   │   └── discussion.py # REST + WebSocket 엔드포인트
     │   └── templates/
     │       └── index.html    # 단일 파일 웹 UI
+    ├── tests/                # pytest 회귀 테스트 스위트
     ├── requirements.txt
-    └── README.md             # 컴포넌트 상세 운영 가이드
+    └── requirements-dev.txt  # 테스트 의존성 (pytest)
 ```
 
 - **상태는 100% DB** — `Orchestrator` 는 토론 상태를 인메모리에 들지 않고, 인프라
@@ -157,6 +174,8 @@ docker compose up --build
 | `POST` | `/discussions/{id}/interventions` | 유저 개입 주입 |
 | `POST` | `/discussions/{id}/manual-response` | 수동 에이전트 응답 주입 (복붙 터널) |
 | `WS`   | `/discussions/{id}/ws` | 진행 상황 실시간 스트림 + 개입 채널 |
+| `GET`  | `/formats` | 등록된 토론 형식 목록 (단계 구성 포함) |
+| `POST` | `/personas/refine` | 페르소나 초안을 주제에 맞춰 LLM 으로 윤문 |
 
 ### 토론 생성 예시
 
@@ -165,6 +184,7 @@ curl -X POST http://127.0.0.1:8000/discussions \
   -H 'Content-Type: application/json' \
   -d '{
     "topic": "원격 근무는 조직 생산성을 높이는가?",
+    "format_id": "debate",
     "agents": [
       {"agent_id": "a1", "name": "찬성 측", "model": "gpt-4o",
        "persona_prompt": "너는 원격 근무 옹호론자다.", "persona_type": "proponent"},
@@ -175,8 +195,9 @@ curl -X POST http://127.0.0.1:8000/discussions \
   }'
 ```
 
-- `agents` 는 **2인 이상** 필수. `persona_prompt` 는 각 에이전트의 시스템 프롬프트다.
-- `temperature`(기본 0.7)·`max_tokens`(기본 1024)·`provider`·`persona_type` 는 선택.
+- `format_id`(기본 `debate`)·`force_consensus` 는 선택. `agents` 는 **2인 이상** 필수.
+- `persona_prompt` 는 각 에이전트의 시스템 프롬프트. `temperature`(기본 0.7)·
+  `max_tokens`(기본 1024)·`provider`·`persona_type` 는 선택.
 
 ### WebSocket 메시지 타입
 
