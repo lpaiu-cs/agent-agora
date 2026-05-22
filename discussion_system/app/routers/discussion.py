@@ -118,6 +118,7 @@ async def create_discussion(
         topic=req.topic,
         format_id=req.format_id,
         agents=req.agents,
+        facilitator=req.facilitator,
         force_consensus=req.force_consensus,
     )
     await database.insert_state(state)

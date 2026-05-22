@@ -30,6 +30,19 @@ def test_create_discussion(client):
     assert body["status"] == "created"
 
 
+def test_create_discussion_with_facilitator(client):
+    r = client.post("/discussions", json={
+        "topic": "사회자 토론", "agents": _manual_agents(),
+        "facilitator": {
+            "agent_id": "fac", "name": "사회자", "model": "gpt-4o-mini",
+            "persona_prompt": "중립적이고 간결한 진행자", "provider": "openai"}})
+    assert r.status_code == 201
+    did = r.json()["discussion_id"]
+    state = client.get(f"/discussions/{did}").json()
+    assert state["facilitator"]["agent_id"] == "fac"
+    assert state["facilitator_notes"] == []
+
+
 def test_create_discussion_rejects_single_agent(client):
     r = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()[:1]})

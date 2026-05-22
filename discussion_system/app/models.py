@@ -21,9 +21,14 @@ _JSON_FIELDS = (
     "phase_records",
     "intercept_agents",
     "review",
+    "facilitator",
+    "facilitator_notes",
     "phase_summaries",
     "user_interventions",
 )
+
+#: None 이 유효값인 JSON 필드 — 비었을 때 [] / {} 로 치환하지 않는다.
+_NULLABLE_JSON_FIELDS = ("review", "facilitator")
 
 #: DiscussionState 의 스칼라 필드 — 전용 컬럼으로 매핑한다.
 _SCALAR_FIELDS = (
@@ -64,6 +69,8 @@ class DiscussionRow(Base):
     phase_records = Column(JSON, nullable=False, default=dict)
     intercept_agents = Column(JSON, nullable=False, default=list)
     review = Column(JSON, nullable=True)                  # 검토 세션 (없으면 NULL)
+    facilitator = Column(JSON, nullable=True)             # 사회자 (없으면 NULL)
+    facilitator_notes = Column(JSON, nullable=False, default=list)
     phase_summaries = Column(JSON, nullable=False, default=list)
     user_interventions = Column(JSON, nullable=False, default=list)
 
@@ -84,7 +91,7 @@ def row_to_state(row: DiscussionRow) -> DiscussionState:
     data: dict = {field: getattr(row, field) for field in _SCALAR_FIELDS}
     for field in _JSON_FIELDS:
         value = getattr(row, field)
-        if value is None and field != "review":
+        if value is None and field not in _NULLABLE_JSON_FIELDS:
             value = {} if field == "phase_records" else []
         data[field] = value
     return DiscussionState.model_validate(data)

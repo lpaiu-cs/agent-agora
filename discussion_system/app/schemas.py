@@ -80,6 +80,7 @@ class WSMessageType(str, Enum):
     MANUAL_INPUT_REQUIRED = "manual_input_required"  # 수동 에이전트 입력 요청(복사 페이로드 포함)
     REVIEW_REQUIRED = "review_required"            # 가로채기 검토 요청(초안·사고흐름)
     REVIEW_ANSWER = "review_answer"                # 검토 문답 — 에이전트 답변
+    FACILITATOR_NOTE = "facilitator_note"          # 사회자 진행 노트(개회·중간·폐회 등)
     ERROR = "error"                                # 오류 발생
     # --- C->S (클라이언트 -> 서버) ---
     USER_INTERVENTION = "user_intervention"        # 유저 개입 주입
@@ -206,6 +207,32 @@ class ReviewState(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 사회자(facilitator) 에이전트
+# ---------------------------------------------------------------------------
+class FacilitatorNote(BaseModel):
+    """사회자가 단계 경계에서 남긴 진행 노트.
+
+    사회자는 토론자가 아니다 — 입장을 갖지 않고 토론을 조율하므로, 그 발언은
+    ``phase_records`` 가 아닌 별도 노트로 누적된다.
+    """
+
+    phase: str = Field(..., description="노트가 속한(직전/직후) 단계 인스턴스 키")
+    kind: str = Field(
+        ...,
+        description="노트 종류: open(개회)·between(중간)·close(폐회)·decision(진행 결정)",
+    )
+    content: str = Field(..., description="사회자 발언 본문")
+    decision: Optional[str] = Field(
+        default=None,
+        description="진행 결정 (kind=decision 일 때): continue·next·conclude",
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="토큰 사용량 등 부가 정보"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 유저 개입
 # ---------------------------------------------------------------------------
 class UserIntervention(BaseModel):
@@ -272,6 +299,16 @@ class DiscussionState(BaseModel):
         description="진행 중인 검토 세션 (status=PENDING_REVIEW 일 때만 채워짐)",
     )
 
+    # --- 사회자(facilitator) 에이전트 ---
+    facilitator: Optional[AgentConfig] = Field(
+        default=None,
+        description="사회자 에이전트 — 단계 경계에서 진행을 조율한다. None=사회자 없음.",
+    )
+    facilitator_notes: list[FacilitatorNote] = Field(
+        default_factory=list,
+        description="사회자가 남긴 진행 노트(개회·중간·폐회 등) 누적",
+    )
+
     # --- 옵션 플래그 ---
     force_consensus: bool = Field(
         default=False,
@@ -321,6 +358,10 @@ class CreateDiscussionRequest(BaseModel):
     )
     agents: list[AgentConfig] = Field(
         ..., min_length=2, description="참여 에이전트 목록 (2인 이상)"
+    )
+    facilitator: Optional[AgentConfig] = Field(
+        default=None,
+        description="사회자 에이전트 (선택). 지정하면 단계 경계마다 진행을 조율한다.",
     )
     force_consensus: bool = Field(
         default=False, description="마지막 단계 합의 강제 여부 (형식이 지원할 때만)"

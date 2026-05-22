@@ -41,6 +41,7 @@ from .schemas import (
     AgentTurn,
     DiscussionState,
     DiscussionStatus,
+    FacilitatorNote,
     ModelProvider,
     PersonaType,
     PhaseSummary,
@@ -540,6 +541,60 @@ def _build_prompt(
     return system, "\n\n".join(user_sections)
 
 
+#: 사회자 훅 종류별 작업 지침. ``decision`` 은 가변 길이 형식 구동에 쓰인다.
+_FACILITATOR_TASKS: dict[str, str] = {
+    "open": (
+        "토론을 연다. 주제의 핵심 쟁점을 짚고, 첫 단계에서 참가자들이 무엇에 "
+        "집중하면 좋을지 2~3문장으로 안내하라."
+    ),
+    "between": (
+        "방금 끝난 단계를 짚어라. 아직 풀리지 않은 가장 첨예한 쟁점 하나를 "
+        "골라, 다음 단계의 초점을 2~3문장으로 제시하라."
+    ),
+    "close": (
+        "토론 전체를 마무리한다. 합의된 지점과 끝내 갈린 지점을 구분해 "
+        "3~4문장으로 정리하라."
+    ),
+    "decision": (
+        "이 반복 단계(문답 라운드)를 한 번 더 진행할지 판단하라. 첫 줄에 정확히 "
+        "'[결정] continue'(라운드 계속)·'[결정] next'(다음 단계로)·"
+        "'[결정] conclude'(토론 종료) 중 하나만 쓰고, 다음 줄부터 그 판단의 "
+        "근거를 2~3문장으로 적어라."
+    ),
+}
+
+
+def _build_facilitator_prompt(
+    state: DiscussionState, kind: str, phase: str
+) -> tuple[str, str]:
+    """사회자 훅용 (system, user) 프롬프트를 조립한다.
+
+    사회자는 토론 전체 기록을 압축 없이(force_full) 받아, 종류별 작업을 수행한다.
+    """
+    fac = state.facilitator
+    persona = fac.persona_prompt if fac is not None else ""
+    system = (
+        f"너는 '{state.topic}' 토론의 사회자(facilitator)다. 토론자가 아니다 — "
+        "어느 한쪽 입장을 편들지 말고, 토론이 생산적으로 굴러가도록 조율하라. "
+        "한국어로 간결하게 작성한다.\n\n"
+        f"[너의 진행 스타일]\n{persona}"
+    )
+    history = _render_history(state, PHASE_COMPLETED, [], force_full=True)
+    task = _FACILITATOR_TASKS.get(kind, "지금까지의 진행 상황을 정리하라.")
+    user = (
+        f"[토론 주제]\n{state.topic}\n\n"
+        f"[지금까지의 토론]\n{history or '(아직 발언 없음)'}\n\n"
+        f"[사회자 작업]\n{task}"
+    )
+    return system, user
+
+
+def _parse_facilitator_decision(text: str) -> Optional[str]:
+    """사회자 응답에서 '[결정] continue|next|conclude' 진행 결정을 추출한다."""
+    match = re.search(r"\[결정\]\s*(continue|next|conclude)", text)
+    return match.group(1) if match else None
+
+
 def generate_deep_copy(
     state: DiscussionState,
     agent_id: str,
@@ -610,11 +665,19 @@ def render_transcript(state: DiscussionState) -> str:
             f"· 합계 {total_p + total_c:,}")
     lines += ["", "## 참여 에이전트", ""]
     lines += [f"- **{a.name}** (`{a.agent_id}`) — {a.model}" for a in state.agents]
+    if state.facilitator is not None:
+        lines.append(
+            f"- 사회자: **{state.facilitator.name}** — {state.facilitator.model}")
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
     if pre:
         lines += ["", "## 진행자 사전 지시", ""]
         lines += [f"> {iv.message}" for iv in pre]
+
+    opening = next(
+        (n for n in state.facilitator_notes if n.kind == "open"), None)
+    if opening is not None:
+        lines += ["", "## 사회자 — 개회", "", opening.content]
 
     for spec, rnd, key in _instances_in_order(fmt, state):
         turns = state.phase_records.get(key, [])
@@ -634,6 +697,15 @@ def render_transcript(state: DiscussionState) -> str:
         for iv in state.user_interventions:
             if iv.after_phase == key:
                 lines.append(f"> 진행자 개입: {iv.message}")
+        for note in state.facilitator_notes:
+            if note.phase == key and note.kind in ("between", "decision"):
+                tag = "진행 결정" if note.kind == "decision" else "중간 조율"
+                lines += ["", f"**사회자 · {tag}**", "", note.content]
+
+    closing = next(
+        (n for n in state.facilitator_notes if n.kind == "close"), None)
+    if closing is not None:
+        lines += ["", "## 사회자 — 폐회", "", closing.content]
 
     if state.final_joint_agreement:
         lines += ["", "## 최종 합의안", "", state.final_joint_agreement]
@@ -711,6 +783,7 @@ class Orchestrator:
         if event is PipelineEvent.START:
             first = plan_next(_format_of(state), PHASE_IDLE)
             if first is not None:
+                await self._run_facilitator(discussion_id, "open", first)
                 await self._run_phase(discussion_id, first)
         elif event is PipelineEvent.ADVANCE:
             if state.status is not DiscussionStatus.WAITING_FOR_USER:
@@ -1217,12 +1290,15 @@ class Orchestrator:
             payload["final_joint_agreement"] = state.final_joint_agreement
         await self._emit(discussion_id, WSMessageType.PHASE_COMPLETED, payload)
         if nxt is None:
+            await self._run_facilitator(discussion_id, "close", PHASE_COMPLETED)
             await self._emit(
                 discussion_id, WSMessageType.DISCUSSION_COMPLETED,
                 {"discussion_id": discussion_id,
                  "final_joint_agreement": state.final_joint_agreement},
             )
         else:
+            # 사회자 중간 조율 — 다음 단계 게이트 직전에 진행 노트를 남긴다.
+            await self._run_facilitator(discussion_id, "between", phase)
             nxt_spec = fmt.phase(nxt)
             await self._emit(
                 discussion_id, WSMessageType.AWAITING_USER,
@@ -1237,11 +1313,47 @@ class Orchestrator:
         합의 근접도가 충분히 높을 때 유저가 누르는 '여기서 종료' 의 진입점이다.
         """
         state = await self._commit(discussion_id, _mark_completed)
+        await self._run_facilitator(discussion_id, "close", PHASE_COMPLETED)
         await self._emit(
             discussion_id, WSMessageType.DISCUSSION_COMPLETED,
             {"discussion_id": discussion_id,
              "final_joint_agreement": state.final_joint_agreement},
         )
+
+    async def _run_facilitator(
+        self, discussion_id: str, kind: str, phase: str
+    ) -> Optional[str]:
+        """사회자 훅 — 단계 경계에서 진행 노트를 생성·기록·브로드캐스트한다.
+
+        사회자가 지정돼 있지 않거나 LLM 호출이 실패하면 조용히 건너뛴다 — 사회자는
+        토론 진행을 막지 않는 부가 레이어다. ``kind="decision"`` 이면 진행 결정
+        ("continue"/"next"/"conclude")을 반환한다(그 외에는 None).
+        """
+        state = await self._load(discussion_id)
+        if state is None or state.facilitator is None:
+            return None
+        # 멱등 — 같은 (kind, phase) 노트가 이미 있으면 LLM 재호출 없이 그 결정을 쓴다.
+        for note in state.facilitator_notes:
+            if note.kind == kind and note.phase == phase:
+                return note.decision
+        system, user = _build_facilitator_prompt(state, kind, phase)
+        try:
+            text, usage = await self._invoke_agent_usage(
+                state.facilitator, system, user)
+        except Exception as exc:  # noqa: BLE001 - 사회자 실패는 비치명적
+            logger.warning("사회자 호출 실패(%s/%s): %r", kind, phase, exc)
+            return None
+        decision = (
+            _parse_facilitator_decision(text) if kind == "decision" else None)
+        note = FacilitatorNote(
+            phase=phase, kind=kind, content=text.strip() or "(빈 응답)",
+            decision=decision, metadata={"usage": usage})
+        await self._commit(
+            discussion_id, lambda s: _append_facilitator_note(s, note))
+        await self._emit(
+            discussion_id, WSMessageType.FACILITATOR_NOTE,
+            {"note": note.model_dump(mode="json")})
+        return decision
 
     async def _run_consensus(self, discussion_id: str, phase: str) -> None:
         """마지막 단계 force_consensus=True — 단일 합의안 문서를 합성한다."""
@@ -1578,6 +1690,19 @@ def _append_review_qa(state: DiscussionState, exchange: ReviewExchange) -> None:
     )
     if not already:
         state.review.qa.append(exchange)
+    state.touch()
+
+
+def _append_facilitator_note(
+    state: DiscussionState, note: FacilitatorNote
+) -> None:
+    """사회자 노트를 추가한다. 멱등 — 같은 (kind, phase) 노트는 한 번만 적재한다."""
+    already = any(
+        n.kind == note.kind and n.phase == note.phase
+        for n in state.facilitator_notes
+    )
+    if not already:
+        state.facilitator_notes.append(note)
     state.touch()
 
 
