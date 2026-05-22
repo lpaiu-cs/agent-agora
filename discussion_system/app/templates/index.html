@@ -72,6 +72,9 @@
           class="ml-auto text-xs px-3 py-1 rounded-full bg-slate-700 text-slate-200">
       대기 중
     </span>
+    <button id="exportBtn"
+            class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
+                   text-slate-200">📄 텍스트 저장</button>
   </header>
 
   <main class="flex-1 flex min-h-0">
@@ -370,6 +373,20 @@ function resetDiscussion() {
   $('topicInput').readOnly = false;   // 다시 편집 가능 상태로
   $('startBtn').disabled = false;
   setStatus('대기 중', '');
+}
+
+// 현재 토론의 전체 기록을 마크다운 텍스트 파일로 내려받는다.
+function exportDiscussion() {
+  if (!discussionId) {
+    alert('저장할 토론이 없습니다. 토론을 먼저 시작하세요.');
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = '/discussions/' + discussionId + '/export';
+  a.download = 'agora-' + discussionId.slice(0, 8) + '.md';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 function connectWS(id) {
@@ -839,6 +856,7 @@ $('startBtn').addEventListener('click', startDiscussion);
 $('resetBtn').addEventListener('click', resetDiscussion);
 $('postBtn').addEventListener('click', postIntervention);
 $('skipBtn').addEventListener('click', skipPhase);
+$('exportBtn').addEventListener('click', exportDiscussion);
 $('topicInput').addEventListener('input', autoGrowTopic);
 $('formatSelect').addEventListener('change', onFormatChange);
 autoGrowTopic();   // 기본 주제 텍스트에 맞춰 초기 높이 조정

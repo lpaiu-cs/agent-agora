@@ -83,3 +83,17 @@ def test_list_formats(client):
     assert [p["id"] for p in formats["brainstorm"]["phases"]] == [
         "diverge", "expand", "converge", "action"]
     assert formats["debate"]["supports_consensus"] is True
+
+
+def test_export_discussion(client):
+    did = client.post("/discussions", json={
+        "topic": "내보내기 주제", "agents": _manual_agents()}).json()["discussion_id"]
+    r = client.get(f"/discussions/{did}/export")
+    assert r.status_code == 200
+    assert "text/markdown" in r.headers["content-type"]
+    assert "attachment" in r.headers.get("content-disposition", "")
+    assert "내보내기 주제" in r.text
+
+
+def test_export_unknown_discussion_returns_404(client):
+    assert client.get("/discussions/does-not-exist/export").status_code == 404

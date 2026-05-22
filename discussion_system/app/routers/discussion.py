@@ -20,10 +20,11 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import PlainTextResponse
 
 from .. import database
 from ..formats import FORMATS
-from ..manager import Orchestrator, PipelineEvent
+from ..manager import Orchestrator, PipelineEvent, render_transcript
 from ..schemas import (
     CreateDiscussionRequest,
     CreateDiscussionResponse,
@@ -125,6 +126,20 @@ async def create_discussion(
 async def get_discussion(discussion_id: str) -> DiscussionState:
     """토론의 전체 상태 스냅샷을 DB 에서 조회해 반환한다."""
     return await _load_or_404(discussion_id)
+
+
+@router.get("/{discussion_id}/export")
+async def export_discussion(discussion_id: str) -> PlainTextResponse:
+    """토론 전체 기록을 마크다운 텍스트 파일로 내려받는다 (종료 여부 무관)."""
+    state = await _load_or_404(discussion_id)
+    return PlainTextResponse(
+        render_transcript(state),
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="agora-{discussion_id[:8]}.md"',
+        },
+    )
 
 
 @router.post("/{discussion_id}/advance", status_code=202)

@@ -479,6 +479,57 @@ def generate_general_copy(
     return "\n\n".join(sections)
 
 
+def render_transcript(state: DiscussionState) -> str:
+    """토론 전체 기록을 마크다운 텍스트로 렌더링한다 (텍스트 내보내기용).
+
+    프롬프트용 ``_render_history`` 와 달리 LTM 압축을 적용하지 않고, 모든 단계의
+    발언 원문·요약·진행자 개입·최종 합의안을 사람이 읽기 좋은 문서로 펼친다.
+    """
+    fmt = _format_of(state)
+    name_of = {a.agent_id: a.name for a in state.agents}
+    summary_of = {s.phase: s for s in state.phase_summaries}
+    lines: list[str] = [
+        f"# Agent Agora — {state.topic}",
+        "",
+        f"- 형식: {fmt.name} (`{state.format_id}`)",
+        f"- 상태: {state.status.value}",
+        f"- 생성: {state.created_at:%Y-%m-%d %H:%M} · "
+        f"갱신: {state.updated_at:%Y-%m-%d %H:%M}",
+        "",
+        "## 참여 에이전트",
+        "",
+    ]
+    lines += [f"- **{a.name}** (`{a.agent_id}`) — {a.model}" for a in state.agents]
+
+    pre = [iv for iv in state.user_interventions if iv.after_phase is None]
+    if pre:
+        lines += ["", "## 진행자 사전 지시", ""]
+        lines += [f"> {iv.message}" for iv in pre]
+
+    for spec in fmt.phases:
+        turns = state.phase_records.get(spec.id, [])
+        if not turns:
+            continue
+        lines += ["", f"## {spec.label}", ""]
+        for turn in turns:
+            speaker = name_of.get(turn.agent_id, turn.agent_id)
+            lines += [f"### {speaker}", "", turn.content, ""]
+        summary = summary_of.get(spec.id)
+        if summary:
+            lines.append(
+                f"_단계 요약 · 합의 근접도 {summary.convergence_score:.0%}_")
+            if summary.key_conflicts:
+                lines.append(
+                    f"_주요 쟁점: {' · '.join(summary.key_conflicts)}_")
+        for iv in state.user_interventions:
+            if iv.after_phase == spec.id:
+                lines.append(f"> 진행자 개입: {iv.message}")
+
+    if state.final_joint_agreement:
+        lines += ["", "## 최종 합의안", "", state.final_joint_agreement]
+    return "\n".join(lines) + "\n"
+
+
 # ===========================================================================
 # 무상태 오케스트레이터
 # ===========================================================================
