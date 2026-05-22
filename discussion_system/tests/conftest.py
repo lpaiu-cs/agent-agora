@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
     create_async_engine,
 )
 
-from app import database  # noqa: E402
+from app import database, manager  # noqa: E402
 from app.schemas import AgentConfig, DiscussionState  # noqa: E402
 
 
@@ -66,3 +66,31 @@ def make_state(make_agent):
             discussion_id=discussion_id, topic=topic, agents=agents, **kw,
         )
     return _make
+
+
+@pytest.fixture
+def patch_llm(monkeypatch):
+    """manager 의 LLM 호출 3종(_call_openai/_anthropic/_ollama)을 가짜로 교체한다.
+
+    반환된 함수에 fake 를 넘기면 세 공급자 경로 모두 그 fake 로 대체된다.
+    fake 시그니처: ``(client, model, system, user, temperature, max_tokens, on_token)``.
+    """
+    def _install(fake):
+        for name in ("_call_openai", "_call_anthropic", "_call_ollama"):
+            monkeypatch.setattr(manager, name, fake)
+    return _install
+
+
+@pytest_asyncio.fixture
+async def orchestrator(fresh_db):
+    """fresh_db 위에서 동작하는 Orchestrator — 브로드캐스트를 ``.broadcasts`` 에 캡처."""
+    pool = manager.LLMClientPool()
+    broadcasts: list = []
+
+    async def broadcast(discussion_id, message):
+        broadcasts.append((discussion_id, message))
+
+    orch = manager.Orchestrator(pool, broadcast)
+    orch.broadcasts = broadcasts
+    yield orch
+    await pool.aclose()
