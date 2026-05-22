@@ -19,6 +19,8 @@ Base = declarative_base()
 _JSON_FIELDS = (
     "agents",
     "phase_records",
+    "intercept_agents",
+    "review",
     "phase_summaries",
     "user_interventions",
 )
@@ -60,6 +62,8 @@ class DiscussionRow(Base):
     # --- JSON 컬럼 (복잡한 딕셔너리/리스트 필드 직렬화) ---
     agents = Column(JSON, nullable=False, default=list)
     phase_records = Column(JSON, nullable=False, default=dict)
+    intercept_agents = Column(JSON, nullable=False, default=list)
+    review = Column(JSON, nullable=True)                  # 검토 세션 (없으면 NULL)
     phase_summaries = Column(JSON, nullable=False, default=list)
     user_interventions = Column(JSON, nullable=False, default=list)
 
@@ -80,7 +84,7 @@ def row_to_state(row: DiscussionRow) -> DiscussionState:
     data: dict = {field: getattr(row, field) for field in _SCALAR_FIELDS}
     for field in _JSON_FIELDS:
         value = getattr(row, field)
-        if value is None:
+        if value is None and field != "review":
             value = {} if field == "phase_records" else []
         data[field] = value
     return DiscussionState.model_validate(data)

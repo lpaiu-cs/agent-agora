@@ -97,3 +97,20 @@ def test_export_discussion(client):
 
 def test_export_unknown_discussion_returns_404(client):
     assert client.get("/discussions/does-not-exist/export").status_code == 404
+
+
+def test_set_intercepts(client):
+    did = client.post("/discussions", json={
+        "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]
+    r = client.post(f"/discussions/{did}/intercept", json={"agent_ids": ["m1"]})
+    assert r.status_code == 200
+    assert r.json()["agent_ids"] == ["m1"]
+
+
+def test_review_endpoints_reject_non_review_state(client):
+    did = client.post("/discussions", json={
+        "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]
+    # 갓 생성된 토론은 PENDING_REVIEW 가 아니므로 409
+    assert client.post(f"/discussions/{did}/review/question",
+                       json={"question": "q"}).status_code == 409
+    assert client.post(f"/discussions/{did}/review/approve").status_code == 409

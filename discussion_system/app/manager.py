@@ -34,6 +34,8 @@ from .schemas import (
     ModelProvider,
     PersonaType,
     PhaseSummary,
+    ReviewExchange,
+    ReviewState,
     UserIntervention,
     WSMessage,
     WSMessageType,
@@ -91,6 +93,8 @@ class PipelineEvent(str, Enum):
     START = "start"                      # 토론 생성 직후 — 1단계 기동
     ADVANCE = "advance"                  # 유저가 다음 단계 진입 승인
     MANUAL_RESPONSE = "manual_response"   # 수동 에이전트 응답 수신
+    REVIEW_QUESTION = "review_question"   # 검토 게이트 — 진행자 질문
+    REVIEW_APPROVE = "review_approve"     # 검토 게이트 — 진행자 승인
     RECOVER = "recover"                   # 서버 재기동 후 크래시 복구
 
 
@@ -265,6 +269,20 @@ def _extract_json(raw: str) -> dict:
 # ===========================================================================
 # 순수 헬퍼 — 상태(state)를 인자로 받는 무상태 함수들
 # ===========================================================================
+def _split_reasoning_draft(text: str) -> tuple[str, str]:
+    """'[사고흐름] … [초안] …' 형식 응답을 (사고흐름, 초안)으로 분리한다.
+
+    [초안] 마커가 없으면 전체를 초안으로 보고 사고흐름은 빈 문자열로 둔다.
+    """
+    marker = "[초안]"
+    idx = text.find(marker)
+    if idx < 0:
+        return "", text.strip()
+    reasoning = text[:idx].replace("[사고흐름]", "").strip()
+    draft = text[idx + len(marker):].strip()
+    return reasoning, draft
+
+
 def _agent_by_id(state: DiscussionState, agent_id: str) -> AgentConfig:
     """agent_id 로 AgentConfig 를 찾는다. 없으면 DiscussionError."""
     for agent in state.agents:
@@ -595,6 +613,10 @@ class Orchestrator:
                 await self._run_phase(discussion_id, nxt.id)
         elif event is PipelineEvent.MANUAL_RESPONSE:
             await self._on_manual_response(state, payload or {})
+        elif event is PipelineEvent.REVIEW_QUESTION:
+            await self._on_review_question(state, payload or {})
+        elif event is PipelineEvent.REVIEW_APPROVE:
+            await self._on_review_approve(state)
         elif event is PipelineEvent.RECOVER:
             await self._on_recover(state)
         else:
@@ -608,15 +630,16 @@ class Orchestrator:
           이므로 유실되지 않는다 — 재기동 없이 후속 /manual-response 를 수용한다.
         """
         stuck = await database.list_states_by_status(
-            ("running", "pending_manual_input")
+            ("running", "pending_manual_input", "pending_review")
         )
         running = [s for s in stuck if s.status is DiscussionStatus.RUNNING]
         pending = [s for s in stuck
-                   if s.status is DiscussionStatus.PENDING_MANUAL_INPUT]
+                   if s.status in (DiscussionStatus.PENDING_MANUAL_INPUT,
+                                   DiscussionStatus.PENDING_REVIEW)]
         for s in pending:
             logger.info(
-                "크래시 복구: %s — PENDING_MANUAL_INPUT 유지, /manual-response 수용 준비 완료",
-                s.discussion_id,
+                "크래시 복구: %s — %s 유지 (후속 입력 수용 준비 완료)",
+                s.discussion_id, s.status.value,
             )
         for s in running:
             logger.info(
@@ -649,6 +672,17 @@ class Orchestrator:
             discussion_id, WSMessageType.USER_INTERVENTION,
             {"intervention": intervention.model_dump(mode="json")},
         )
+
+    async def set_intercepts(
+        self, discussion_id: str, agent_ids: list[str]
+    ) -> None:
+        """검토 게이트로 가로챌 에이전트 목록을 설정한다 (빈 목록=해제).
+
+        가로채기는 *다음* 턴부터 적용된다 — 지정된 API 에이전트는 자동 포스팅
+        대신 초안·사고흐름을 만들고 PENDING_REVIEW 로 대기한다.
+        """
+        await self._commit(
+            discussion_id, lambda s: _set_intercepts(s, agent_ids))
 
     async def emit_manual_input_required_for_socket(
         self, discussion_id: str, websocket
@@ -748,6 +782,111 @@ class Orchestrator:
         # 단계 진행 재개 — 다음 에이전트(들) 처리 또는 단계 종료.
         await self._advance_phase_progress(state.discussion_id, phase)
 
+    async def _on_review_question(
+        self, state: DiscussionState, payload: dict
+    ) -> None:
+        """검토 중인 에이전트에게 진행자 질문을 던지고 답변을 받는다."""
+        if (state.status is not DiscussionStatus.PENDING_REVIEW
+                or state.review is None):
+            raise InvalidStateTransition(
+                f"검토 문답은 PENDING_REVIEW 에서만 가능 (현재 {state.status.value})"
+            )
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            raise InvalidStateTransition("질문이 비어 있습니다.")
+        review = state.review
+        agent = _agent_by_id(state, review.agent_id)
+        try:
+            answer = await self._answer_review_question(
+                state, agent, review, question)
+        except Exception as exc:  # noqa: BLE001 - 우아한 부분 실패 수용
+            logger.warning("검토 답변 생성 실패: %r", exc)
+            answer = f"[시스템 경고: 답변 생성 실패 - {exc}]"
+        exchange = ReviewExchange(question=question, answer=answer)
+        await self._commit(
+            state.discussion_id, lambda s: _append_review_qa(s, exchange))
+        await self._emit(
+            state.discussion_id, WSMessageType.REVIEW_ANSWER,
+            {"exchange": exchange.model_dump(mode="json")},
+        )
+
+    async def _on_review_approve(self, state: DiscussionState) -> None:
+        """검토 승인 — 초안·문답을 종합한 최종 발언을 확정하고 단계 진행을 재개한다."""
+        if (state.status is not DiscussionStatus.PENDING_REVIEW
+                or state.review is None):
+            raise InvalidStateTransition(
+                f"검토 승인은 PENDING_REVIEW 에서만 가능 (현재 {state.status.value})"
+            )
+        review = state.review
+        agent = _agent_by_id(state, review.agent_id)
+        try:
+            final = await self._finalize_reviewed_turn(state, agent, review)
+        except Exception as exc:  # noqa: BLE001 - 우아한 부분 실패 수용
+            logger.warning("검토 최종 발언 생성 실패: %r", exc)
+            final = review.draft or f"[시스템 경고: 최종 발언 생성 실패 - {exc}]"
+        phase = review.phase
+        turn = AgentTurn(
+            agent_id=review.agent_id, phase=phase, content=final,
+            metadata={"provider": agent.get_provider().value,
+                      "model": agent.model, "reviewed": True},
+        )
+
+        def commit_final(s: DiscussionState) -> None:
+            _record_turns(s, phase, [turn])
+            _clear_review(s)
+
+        await self._commit(state.discussion_id, commit_final)
+        await self._emit_turn(state.discussion_id, turn)
+        await self._advance_phase_progress(state.discussion_id, phase)
+
+    async def _answer_review_question(
+        self, state: DiscussionState, agent: AgentConfig,
+        review: ReviewState, question: str,
+    ) -> str:
+        """검토 중 진행자 질문에 에이전트로서 답한다."""
+        qa_text = "\n".join(
+            f"진행자: {x.question}\n너: {x.answer}" for x in review.qa
+        )
+        system = (
+            f"너는 '{state.topic}' 토론의 참가자다. 진행자가 너의 발언 초안에 "
+            "대해 질문한다. 초안의 의도를 솔직하게 설명하고, 타당한 지적이면 "
+            "수용 의사를 밝혀라. 간결하게 답한다."
+        )
+        user = (
+            f"[너의 사고흐름]\n{review.reasoning}\n\n"
+            f"[너의 발언 초안]\n{review.draft}\n\n"
+            + (f"[지금까지의 문답]\n{qa_text}\n\n" if qa_text else "")
+            + f"[진행자 질문]\n{question}\n\n[지시] 위 질문에 답하라."
+        )
+        return (await self._invoke_agent(agent, system, user)).strip()
+
+    async def _finalize_reviewed_turn(
+        self, state: DiscussionState, agent: AgentConfig, review: ReviewState,
+    ) -> str:
+        """검토 초안 + 문답을 종합한 최종 발언을 만든다.
+
+        문답이 없으면 초안을 그대로 최종 발언으로 쓴다 (불필요한 LLM 호출 회피).
+        """
+        if not review.qa:
+            return review.draft
+        qa_text = "\n".join(
+            f"진행자: {x.question}\n너: {x.answer}" for x in review.qa
+        )
+        fmt = _format_of(state)
+        spec = fmt.phase(review.phase)
+        instruction = spec.instruction if spec else ""
+        system = (
+            fmt.common_rules.format(topic=state.topic)
+            + f"\n\n[너의 페르소나]\n{agent.persona_prompt}"
+        )
+        user = (
+            f"[너의 발언 초안]\n{review.draft}\n\n"
+            f"[진행자와의 문답]\n{qa_text}\n\n"
+            f"[이번 단계 작업]\n{instruction}\n\n"
+            "[지시] 위 문답을 반영해 최종 발언을 완성하라. 발언 본문만 출력하라."
+        )
+        return (await self._invoke_agent(agent, system, user)).strip()
+
     # ----- 단계 실행 -----
     async def _run_phase(self, discussion_id: str, phase: str) -> None:
         """단계 진입 — status RUNNING 마킹 후 진행 가능한 데까지 수행한다."""
@@ -788,6 +927,9 @@ class Orchestrator:
             if nxt.provider is ModelProvider.MANUAL:
                 await self._enter_pending(discussion_id, phase, [nxt])
                 return
+            if nxt.agent_id in state.intercept_agents:
+                await self._enter_review(discussion_id, phase, nxt, list(record))
+                return
             turn = await self._do_api_turn(state, phase, nxt, list(record))
             await self._commit(
                 discussion_id, lambda s: _record_turns(s, phase, [turn])
@@ -796,17 +938,27 @@ class Orchestrator:
             # 다음 에이전트로 진행 (재귀 — 깊이 = 에이전트 수).
             await self._advance_phase_progress(discussion_id, phase)
         else:
-            api_pending = [a for a in pending
-                           if a.provider is not ModelProvider.MANUAL]
+            auto_api = [a for a in pending
+                        if a.provider is not ModelProvider.MANUAL
+                        and a.agent_id not in state.intercept_agents]
+            review_api = [a for a in pending
+                          if a.provider is not ModelProvider.MANUAL
+                          and a.agent_id in state.intercept_agents]
             manual_pending = [a for a in pending
                               if a.provider is ModelProvider.MANUAL]
-            if api_pending:
-                turns = await self._gather_api_turns(state, phase, api_pending)
+            if auto_api:
+                turns = await self._gather_api_turns(state, phase, auto_api)
                 await self._commit(
                     discussion_id, lambda s: _record_turns(s, phase, turns)
                 )
                 for turn in turns:
                     await self._emit_turn(discussion_id, turn)
+            # 가로채기된 에이전트·수동 에이전트는 한 번에 하나씩 대기로 보낸다 —
+            # 해당 대기가 풀리면 _advance_phase_progress 가 재호출돼 나머지를 잇는다.
+            if review_api:
+                await self._enter_review(
+                    discussion_id, phase, review_api[0], [])
+                return
             if manual_pending:
                 await self._enter_pending(discussion_id, phase, manual_pending)
                 return
@@ -849,6 +1001,51 @@ class Orchestrator:
             "토론 %s — 수동 입력 대기 진입 (%s, %d명) — 메모리 반환",
             discussion_id, phase, len(manual_agents),
         )
+
+    async def _enter_review(
+        self, discussion_id: str, phase: str, agent: AgentConfig,
+        prior_turns: list[AgentTurn],
+    ) -> None:
+        """가로채기된 API 에이전트 차례 — 초안·사고흐름을 만들고 PENDING_REVIEW 로.
+
+        에이전트가 곧바로 포스팅하지 않고 사고흐름과 발언 초안을 먼저 생성한다.
+        토론은 PENDING_REVIEW 로 대기하며 진행자의 문답·승인을 기다린다 —
+        manual 복붙 터널과 평행한 새 대기 상태다(메모리 자원 즉시 반환).
+        """
+        state = await self._load(discussion_id)
+        if state is None:
+            return
+        try:
+            reasoning, draft = await self._draft_with_reasoning(
+                state, phase, agent, prior_turns)
+        except Exception as exc:  # noqa: BLE001 - 우아한 부분 실패 수용
+            logger.warning("검토 초안 생성 실패(%s): %r", agent.agent_id, exc)
+            reasoning, draft = "", f"[시스템 경고: 초안 생성 실패 - {exc}]"
+        review = ReviewState(agent_id=agent.agent_id, phase=phase,
+                             reasoning=reasoning, draft=draft)
+        await self._commit(discussion_id, lambda s: _set_review(s, review))
+        await self._emit(
+            discussion_id, WSMessageType.REVIEW_REQUIRED,
+            {"review": review.model_dump(mode="json")},
+        )
+        logger.info(
+            "토론 %s — 검토 대기 진입 (%s, 에이전트 %s) — 메모리 반환",
+            discussion_id, phase, agent.agent_id,
+        )
+
+    async def _draft_with_reasoning(
+        self, state: DiscussionState, phase: str, agent: AgentConfig,
+        prior_turns: list[AgentTurn],
+    ) -> tuple[str, str]:
+        """발언 전 사고흐름 + 초안을 한 번의 LLM 호출로 생성한다."""
+        system, user = _build_prompt(state, agent, phase, prior_turns)
+        user += (
+            "\n\n[검토 모드] 최종 발언을 곧바로 쓰지 말고, 먼저 너의 사고 과정을 "
+            "적은 뒤 발언 초안을 작성하라. 정확히 아래 형식으로만 출력하라:\n"
+            "[사고흐름]\n(왜 그렇게 판단했는지 간단히)\n[초안]\n(발언 초안)"
+        )
+        content = await self._invoke_agent(agent, system, user)
+        return _split_reasoning_draft(content)
 
     async def _finish_phase(self, discussion_id: str, phase: str) -> None:
         """단계 종료 — 요약 생성 -> 게이트(WAITING) 또는 토론 종료(COMPLETED)."""
@@ -1180,4 +1377,38 @@ def _set_error(state: DiscussionState, message: str) -> None:
     """오류 상태 전이. 멱등."""
     state.status = DiscussionStatus.ERROR
     state.error = message
+    state.touch()
+
+
+def _set_review(state: DiscussionState, review: ReviewState) -> None:
+    """검토 세션을 설정하고 PENDING_REVIEW 로 전이한다. 멱등."""
+    state.review = review
+    state.status = DiscussionStatus.PENDING_REVIEW
+    state.touch()
+
+
+def _clear_review(state: DiscussionState) -> None:
+    """검토 세션을 종료하고 RUNNING 으로 되돌린다 (승인 후). 멱등."""
+    state.review = None
+    if state.status is DiscussionStatus.PENDING_REVIEW:
+        state.status = DiscussionStatus.RUNNING
+    state.touch()
+
+
+def _append_review_qa(state: DiscussionState, exchange: ReviewExchange) -> None:
+    """검토 문답 1쌍을 추가한다. 멱등 — 같은 (created_at, question) 은 건너뛴다."""
+    if state.review is None:
+        return
+    already = any(
+        x.created_at == exchange.created_at and x.question == exchange.question
+        for x in state.review.qa
+    )
+    if not already:
+        state.review.qa.append(exchange)
+    state.touch()
+
+
+def _set_intercepts(state: DiscussionState, agent_ids: list[str]) -> None:
+    """가로채기 대상 에이전트 목록을 설정한다. 멱등."""
+    state.intercept_agents = list(agent_ids)
     state.touch()

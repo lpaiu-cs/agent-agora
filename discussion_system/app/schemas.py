@@ -30,7 +30,8 @@ class DiscussionStatus(str, Enum):
     RUNNING = "running"                    # 단계 실행 중
     WAITING_FOR_USER = "waiting_for_user"  # 단계 종료, 게이트 락 — 유저 개입 대기
     PENDING_MANUAL_INPUT = "pending_manual_input"  # 수동 에이전트 응답 입력 대기
-    COMPLETED = "completed"                # 5단계까지 정상 종료
+    PENDING_REVIEW = "pending_review"      # 가로채기된 에이전트 초안 검토 대기
+    COMPLETED = "completed"                # 정상 종료
     ERROR = "error"                        # 오류로 중단
 
 
@@ -77,6 +78,8 @@ class WSMessageType(str, Enum):
     AWAITING_USER = "awaiting_user"                # 게이트 락 — 유저 개입 대기 알림
     DISCUSSION_COMPLETED = "discussion_completed"  # 토론 종료
     MANUAL_INPUT_REQUIRED = "manual_input_required"  # 수동 에이전트 입력 요청(복사 페이로드 포함)
+    REVIEW_REQUIRED = "review_required"            # 가로채기 검토 요청(초안·사고흐름)
+    REVIEW_ANSWER = "review_answer"                # 검토 문답 — 에이전트 답변
     ERROR = "error"                                # 오류 발생
     # --- C->S (클라이언트 -> 서버) ---
     USER_INTERVENTION = "user_intervention"        # 유저 개입 주입
@@ -180,6 +183,29 @@ class PhaseSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 검토 게이트 (선택적 가로채기)
+# ---------------------------------------------------------------------------
+class ReviewExchange(BaseModel):
+    """검토 게이트에서 진행자와 에이전트가 주고받은 문답 1쌍."""
+
+    question: str = Field(..., description="진행자가 던진 질문")
+    answer: str = Field(..., description="에이전트의 답변")
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ReviewState(BaseModel):
+    """가로채기된 에이전트 턴의 검토 세션 — 초안·사고흐름·문답을 담는다."""
+
+    agent_id: str = Field(..., description="검토 대상 에이전트 ID")
+    phase: str = Field(..., description="검토 중인 단계 id")
+    reasoning: str = Field(default="", description="에이전트의 사고흐름")
+    draft: str = Field(default="", description="에이전트의 발언 초안")
+    qa: list[ReviewExchange] = Field(
+        default_factory=list, description="진행자-에이전트 문답 기록"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 유저 개입
 # ---------------------------------------------------------------------------
 class UserIntervention(BaseModel):
@@ -234,6 +260,16 @@ class DiscussionState(BaseModel):
     # --- 유저 개입 기록 ---
     user_interventions: list[UserIntervention] = Field(
         default_factory=list, description="누적 유저 개입 기록"
+    )
+
+    # --- 검토 게이트 (선택적 가로채기) ---
+    intercept_agents: list[str] = Field(
+        default_factory=list,
+        description="다음 턴을 검토 게이트로 가로챌 에이전트 ID 목록",
+    )
+    review: Optional[ReviewState] = Field(
+        default=None,
+        description="진행 중인 검토 세션 (status=PENDING_REVIEW 일 때만 채워짐)",
     )
 
     # --- 옵션 플래그 ---
@@ -305,6 +341,20 @@ class ManualResponseRequest(BaseModel):
     agent_id: str = Field(..., description="응답을 주입할 수동 에이전트 ID")
     phase: str = Field(..., description="응답이 속한 단계 id")
     content: str = Field(..., min_length=1, description="유저가 붙여넣은 응답 본문")
+
+
+class SetInterceptsRequest(BaseModel):
+    """검토 게이트로 가로챌 에이전트 지정 요청 (빈 목록이면 가로채기 해제)."""
+
+    agent_ids: list[str] = Field(
+        default_factory=list, description="가로챌 API 에이전트 ID 목록"
+    )
+
+
+class ReviewQuestionRequest(BaseModel):
+    """검토 중인 에이전트에게 던지는 진행자 질문."""
+
+    question: str = Field(..., min_length=1, description="진행자의 질문")
 
 
 class RefinePersonaRequest(BaseModel):

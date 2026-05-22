@@ -2,7 +2,7 @@
 import pytest
 
 from app import manager
-from app.manager import _llm_agent, _positive_int_env
+from app.manager import _llm_agent, _positive_int_env, _split_reasoning_draft
 from app.schemas import AgentConfig, DiscussionState, ModelProvider
 
 
@@ -45,3 +45,14 @@ def test_llm_agent_falls_back_when_all_manual():
 
 def test_fallback_model_default_is_gpt_4o_mini():
     assert manager._FALLBACK_LLM_MODEL == "gpt-4o-mini"
+
+
+def test_split_reasoning_draft():
+    reasoning, draft = _split_reasoning_draft(
+        "[사고흐름]\n이렇게 생각한다\n[초안]\n발언 초안 본문")
+    assert reasoning == "이렇게 생각한다"
+    assert draft == "발언 초안 본문"
+    # [초안] 마커가 없으면 전체를 초안으로 본다
+    reasoning, draft = _split_reasoning_draft("마커 없는 텍스트")
+    assert reasoning == ""
+    assert draft == "마커 없는 텍스트"

@@ -34,6 +34,8 @@ from ..schemas import (
     ModelProvider,
     RefinePersonaRequest,
     RefinePersonaResponse,
+    ReviewQuestionRequest,
+    SetInterceptsRequest,
     UserIntervention,
     WSMessage,
     WSMessageType,
@@ -195,6 +197,69 @@ async def submit_manual_response(
          "content": req.content},
     )
     return {"status": "manual_response_accepted", "discussion_id": discussion_id}
+
+
+# ---------------------------------------------------------------------------
+# 검토 게이트 — 선택적 가로채기
+# ---------------------------------------------------------------------------
+@router.post("/{discussion_id}/intercept", status_code=200)
+async def set_intercepts(
+    discussion_id: str,
+    req: SetInterceptsRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> dict[str, object]:
+    """검토 게이트로 가로챌 에이전트를 지정한다 (빈 목록이면 해제).
+
+    가로채기는 다음 턴부터 적용된다 — 지정된 API 에이전트는 자동 포스팅 대신
+    초안·사고흐름을 만들고 검토 대기(PENDING_REVIEW)로 멈춘다.
+    """
+    await _load_or_404(discussion_id)
+    await orchestrator.set_intercepts(discussion_id, req.agent_ids)
+    return {"status": "intercepts_set", "agent_ids": req.agent_ids}
+
+
+@router.post("/{discussion_id}/review/question", status_code=202)
+async def submit_review_question(
+    discussion_id: str,
+    req: ReviewQuestionRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> dict[str, str]:
+    """검토 중인 에이전트에게 질문을 던진다. 답변은 WS(review_answer)로 온다.
+
+    PENDING_REVIEW 상태가 아니면 HTTP 409.
+    """
+    state = await _load_or_404(discussion_id)
+    if state.status is not DiscussionStatus.PENDING_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"검토 문답은 'pending_review' 상태에서만 가능합니다 "
+                   f"(현재: {state.status.value}).",
+        )
+    orchestrator.trigger(
+        discussion_id, PipelineEvent.REVIEW_QUESTION,
+        {"question": req.question},
+    )
+    return {"status": "review_question_accepted", "discussion_id": discussion_id}
+
+
+@router.post("/{discussion_id}/review/approve", status_code=202)
+async def approve_review(
+    discussion_id: str,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> dict[str, str]:
+    """검토 중인 초안을 승인한다 — 문답을 반영한 최종 발언 확정 후 단계가 재개된다.
+
+    PENDING_REVIEW 상태가 아니면 HTTP 409.
+    """
+    state = await _load_or_404(discussion_id)
+    if state.status is not DiscussionStatus.PENDING_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"검토 승인은 'pending_review' 상태에서만 가능합니다 "
+                   f"(현재: {state.status.value}).",
+        )
+    orchestrator.trigger(discussion_id, PipelineEvent.REVIEW_APPROVE)
+    return {"status": "review_approved", "discussion_id": discussion_id}
 
 
 # ---------------------------------------------------------------------------
