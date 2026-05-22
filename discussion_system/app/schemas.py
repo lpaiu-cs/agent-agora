@@ -54,14 +54,22 @@ class ModelProvider(str, Enum):
 
 
 class PersonaType(str, Enum):
-    """에이전트의 토론 성향. UI 말풍선 색상 구분에 사용된다."""
+    """에이전트의 브레인스토밍 / 토론 성향. UI 말풍선 색상·라벨 구분에 쓰인다."""
 
-    PROPONENT = "proponent"        # 찬성론자
-    OPPONENT = "opponent"          # 반대론자
-    FACT_CHECKER = "fact_checker"  # 팩트체커
-    MEDIATOR = "mediator"          # 중재자
-    ANALYST = "analyst"            # 분석가
-    NEUTRAL = "neutral"            # 중립
+    # --- 브레인스토밍 역할 (현행 UI 노출) ---
+    IDEATOR = "ideator"          # 아이디어 발상가 — 새 아이디어를 자유롭게 발산
+    BUILDER = "builder"          # 아이디어 확장가 — 남의 아이디어에 살을 붙임
+    CRITIC = "critic"            # 비판적 검토자 — 약점을 건설적으로 짚음
+    SYNTHESIZER = "synthesizer"  # 통합·정리자 — 흩어진 아이디어를 묶음
+    PRAGMATIST = "pragmatist"    # 실용성 검토자 — 실행 가능성·제약을 따짐
+    NEUTRAL = "neutral"          # 자유 참여자 — 특정 역할 없이 참여
+
+    # --- 레거시 (구 토론 데이터 역직렬화 호환용 — UI 미노출) ---
+    PROPONENT = "proponent"
+    OPPONENT = "opponent"
+    FACT_CHECKER = "fact_checker"
+    MEDIATOR = "mediator"
+    ANALYST = "analyst"
 
 
 class WSMessageType(str, Enum):
@@ -332,6 +340,29 @@ class ManualResponseRequest(BaseModel):
     agent_id: str = Field(..., description="응답을 주입할 수동 에이전트 ID")
     phase: DiscussionPhase = Field(..., description="응답이 속한 단계")
     content: str = Field(..., min_length=1, description="유저가 붙여넣은 응답 본문")
+
+
+class RefinePersonaRequest(BaseModel):
+    """페르소나 초안 윤문 요청.
+
+    사용자가 대강 쓴 페르소나 초안을 토론 주제 맥락에 맞춰 다듬는다. 윤문은
+    해당 에이전트 슬롯에 설정된 ``provider``/``model`` 로 수행한다.
+    """
+
+    topic: str = Field(..., min_length=1, description="토론 주제 (윤문 맥락)")
+    draft: str = Field(..., min_length=1, description="사용자가 대강 쓴 페르소나 초안")
+    provider: ModelProvider = Field(..., description="윤문에 사용할 LLM 공급자")
+    model: str = Field(..., min_length=1, description="윤문에 사용할 모델명")
+    name: str = Field(default="", description="에이전트 표시 이름 (맥락 보강용, 선택)")
+    persona_type: Optional[PersonaType] = Field(
+        default=None, description="에이전트 역할 (맥락 보강용, 선택)"
+    )
+
+
+class RefinePersonaResponse(BaseModel):
+    """페르소나 윤문 결과."""
+
+    refined: str = Field(..., description="주제에 맞춰 윤문된 페르소나 프롬프트")
 
 
 class WSMessage(BaseModel):

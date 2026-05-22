@@ -46,9 +46,11 @@ BroadcastCallback = Callable[[str, WSMessage], Awaitable[None]]
 #: 토큰 콜백: 스트리밍 청크 1개를 받아 (비동기로) 처리하는 함수.
 TokenCallback = Callable[[str], Awaitable[None]]
 
-#: 순차 포스팅으로 진행되는 단계 (후순위 에이전트가 선행 의견을 맥락으로 본다).
+#: 순차 포스팅 단계 — 후순위 에이전트가 같은 단계의 선행 의견을 맥락으로 본다.
+#: 1단계(초기 주장)는 각 에이전트가 서로의 발제를 보지 않고 독립적으로 동시
+#: 발제해야 하므로 제외한다 — 포함하면 후순위 발제자에게 선행 발제가 새어 든다.
 _SEQUENTIAL_PHASES: frozenset[DiscussionPhase] = frozenset(
-    {DiscussionPhase.PHASE_1_OPINION, DiscussionPhase.PHASE_2_CRITIQUE}
+    {DiscussionPhase.PHASE_2_CRITIQUE}
 )
 
 #: 합의안 합성 발언에 쓰는 가상 발화자 ID (5단계 force_consensus=True).
@@ -72,6 +74,11 @@ def _positive_int_env(name: str, default: int) -> int:
 #: 에서 대기한다 — 동시 코루틴 폭주로 인한 CPU 스파이크와 낙관적 락 경합 폭증을
 #: 막는 백프레셔 장치다. ``AGORA_MAX_CONCURRENT_LLM`` 환경변수로 조정한다.
 _MAX_CONCURRENT_LLM = _positive_int_env("AGORA_MAX_CONCURRENT_LLM", 8)
+
+#: 전원 manual 토론에서 시스템 LLM 호출(단계 요약·합의 근접도·합의안 합성)에
+#: 쓸 폴백 모델. 호출 가능한 API 에이전트가 하나도 없을 때만 사용한다.
+#: OPENAI_API_KEY 가 있어야 동작하며, 없으면 해당 호출은 우아하게 실패 처리된다.
+_FALLBACK_LLM_MODEL = os.getenv("AGORA_FALLBACK_MODEL", "gpt-4o-mini")
 
 
 # ===========================================================================
@@ -312,11 +319,22 @@ def _agent_by_id(state: DiscussionState, agent_id: str) -> AgentConfig:
 
 
 def _llm_agent(state: DiscussionState) -> AgentConfig:
-    """요약/합성 등 시스템 LLM 호출에 쓸 에이전트 — 첫 번째 비-manual 에이전트."""
+    """요약/합성 등 시스템 LLM 호출에 쓸 에이전트를 고른다.
+
+    첫 번째 비-manual 에이전트를 쓴다. 모든 참가자가 manual 이라 호출 가능한
+    API 가 하나도 없으면 — manual 공급자로는 단계 요약·합의 근접도·합의안 합성
+    같은 시스템 호출을 수행할 수 없으므로 — 폴백 모델(``_FALLBACK_LLM_MODEL``,
+    기본 ``gpt-4o-mini``)로 시스템 호출 전용 임시 에이전트를 만들어 반환한다.
+    provider 는 model 명에서 추론되며(gpt-* → OpenAI), OPENAI_API_KEY 가 없으면
+    호출이 실패해도 호출부(_summarize_phase 등)가 우아하게 흡수한다.
+    """
     for agent in state.agents:
         if agent.provider is not ModelProvider.MANUAL:
             return agent
-    return state.agents[0]
+    return AgentConfig(
+        agent_id="_system_fallback", name="시스템",
+        model=_FALLBACK_LLM_MODEL, persona_prompt="",
+    )
 
 
 def _failure_turn(
@@ -631,7 +649,9 @@ class Orchestrator:
                 return
             record = state.record_for_phase(phase)
             posted = {t.agent_id for t in record}
-            prior = list(record)
+            # posted 는 이미 발언한 에이전트 판별용(항상 전체), prior 는 복사본에
+            # 넣을 맥락 — 동시 단계에서는 서로의 발제가 새지 않도록 비운다.
+            prior = list(record) if phase in _SEQUENTIAL_PHASES else []
             for agent in state.agents:
                 if (agent.provider is not ModelProvider.MANUAL
                         or agent.agent_id in posted):
@@ -778,7 +798,12 @@ class Orchestrator:
         state = await self._load(discussion_id)
         if state is None:
             return
-        prior = list(state.record_for_phase(phase))
+        # 같은 단계의 선행 의견은 '순차' 단계에서만 맥락으로 넣는다. 동시 단계
+        # (1·3·4·5단계)는 서로의 발제를 보면 안 되므로 빈 맥락으로 복사본을 만든다.
+        prior = (
+            list(state.record_for_phase(phase))
+            if phase in _SEQUENTIAL_PHASES else []
+        )
         for agent in manual_agents:
             deep = generate_deep_copy(state, agent.agent_id, phase, prior)
             general = generate_general_copy(state, agent.agent_id, phase, prior)
@@ -918,6 +943,39 @@ class Orchestrator:
                     agent.temperature, agent.max_tokens, on_token,
                 )
         raise DiscussionError(f"미지원 LLM 공급자: {provider}")
+
+    async def refine_persona(
+        self, *, topic: str, draft: str, provider: ModelProvider,
+        model: str, name: str = "", persona_role: str = "",
+    ) -> str:
+        """페르소나 초안을 토론 주제 맥락에 맞춰 윤문한다.
+
+        지정된 ``provider``/``model`` (보통 해당 에이전트 슬롯의 설정)로 LLM 을
+        호출한다. 모든 LLM 경로와 동일하게 ``_invoke_agent`` 를 거치므로 동시
+        호출 세마포어의 백프레셔도 함께 적용된다.
+        """
+        role_hint = (
+            f" 이 에이전트의 역할 분류는 '{persona_role}' 다." if persona_role else ""
+        )
+        system = (
+            "너는 다자 브레인스토밍·토론 세션에 투입할 에이전트의 '페르소나 "
+            "프롬프트'를 다듬는 편집자다. 사용자가 대강 적어 둔 초안을, 주어진 "
+            "주제에 어울리는 명확하고 구체적인 1인칭 지시문으로 윤문한다. 2~4문장 "
+            "으로 간결하게, 초안의 의도는 보존하되 표현을 또렷하게 한다. 결과는 "
+            "페르소나 본문만 출력하고 따옴표·머리말·부연 설명은 붙이지 않는다."
+        )
+        user = (
+            f"[토론 주제]\n{topic}\n\n"
+            f"[에이전트 이름] {name or '(미정)'}.{role_hint}\n\n"
+            f"[페르소나 초안]\n{draft}\n\n"
+            "[지시] 위 초안을 주제에 맞춰 윤문한 페르소나 프롬프트만 출력하라."
+        )
+        refiner = AgentConfig(
+            agent_id="_refiner", name="refiner", model=model,
+            persona_prompt="", provider=provider, temperature=0.4,
+        )
+        refined = await self._invoke_agent(refiner, system, user)
+        return refined.strip()
 
     async def _synthesize(self, state: DiscussionState) -> str:
         """4단계까지를 종합해 단일 최종 합의안 문서를 생성한다(스트리밍)."""

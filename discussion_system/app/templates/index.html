@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Agent Agora — 다중 에이전트 토론</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<!-- 마크다운 렌더링: marked 로 파싱, DOMPurify 로 XSS 차단 후 출력 -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <style>
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
   .msg-body.streaming::after {
@@ -18,6 +21,11 @@
   .bubble--mediator     { border-color: #a78bfa; background: #f5f3ff; }
   .bubble--analyst      { border-color: #fbbf24; background: #fffbeb; }
   .bubble--neutral      { border-color: #cbd5e1; background: #f8fafc; }
+  .bubble--ideator      { border-color: #fbbf24; background: #fffbeb; }
+  .bubble--builder      { border-color: #34d399; background: #ecfdf5; }
+  .bubble--critic       { border-color: #fb7185; background: #fff1f2; }
+  .bubble--synthesizer  { border-color: #a78bfa; background: #f5f3ff; }
+  .bubble--pragmatist   { border-color: #38bdf8; background: #f0f9ff; }
   .bubble--consensus    { border-color: #2dd4bf; background: #f0fdfa; }
   .bubble--warning      { border-color: #f87171; background: #fef2f2; }
   .bubble--hint  { border: 1px solid #fcd34d; border-left: 4px solid #f59e0b; background: #fffbeb; }
@@ -25,6 +33,33 @@
   .timeline::-webkit-scrollbar-thumb, aside::-webkit-scrollbar-thumb {
     background: #cbd5e1; border-radius: 4px;
   }
+  /* 마크다운 포스팅 — Tailwind preflight 가 기본 스타일을 리셋하므로 재정의한다 */
+  .md { white-space: normal; word-break: break-word; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0.5em 0; }
+  .md h1, .md h2, .md h3, .md h4 { font-weight: 700; line-height: 1.3; margin: 0.8em 0 0.4em; }
+  .md h1 { font-size: 1.25em; }
+  .md h2 { font-size: 1.15em; }
+  .md h3 { font-size: 1.05em; }
+  .md ul, .md ol { margin: 0.5em 0; padding-left: 1.4em; }
+  .md ul { list-style: disc; }
+  .md ol { list-style: decimal; }
+  .md li { margin: 0.2em 0; }
+  .md strong { font-weight: 700; }
+  .md em { font-style: italic; }
+  .md a { color: #2563eb; text-decoration: underline; }
+  .md code { background: #e2e8f0; padding: 0.1em 0.35em; border-radius: 4px;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  .md pre { background: #1e293b; color: #e2e8f0; padding: 0.8em; border-radius: 6px;
+            overflow-x: auto; margin: 0.6em 0; }
+  .md pre code { background: none; padding: 0; color: inherit; }
+  .md blockquote { border-left: 3px solid #cbd5e1; padding-left: 0.8em;
+                   margin: 0.5em 0; color: #475569; }
+  .md table { border-collapse: collapse; margin: 0.6em 0; }
+  .md th, .md td { border: 1px solid #cbd5e1; padding: 0.3em 0.6em; text-align: left; }
+  .md th { background: #f1f5f9; font-weight: 700; }
+  .md hr { border: 0; border-top: 1px solid #cbd5e1; margin: 0.8em 0; }
 </style>
 </head>
 <body class="h-screen flex flex-col bg-slate-100 text-slate-800">
@@ -44,11 +79,6 @@
     <!-- ===== 세팅 존 ===== -->
     <aside class="w-[380px] bg-white border-r border-slate-200 overflow-y-auto p-4 shrink-0">
       <h2 class="text-sm font-bold text-slate-700 mb-3">⚙️ 토론 설정</h2>
-
-      <label class="block text-xs font-semibold text-slate-500 mb-1">토론 주제</label>
-      <input id="topicInput" type="text"
-             value="원격근무는 조직의 생산성을 높이는가?"
-             class="w-full mb-3 px-2 py-1.5 text-sm border border-slate-300 rounded" />
 
       <label class="flex items-center gap-2 cursor-pointer mb-4">
         <input type="checkbox" id="forceToggle" class="sr-only peer" />
@@ -71,13 +101,28 @@
                      hover:bg-slate-700 disabled:bg-slate-400">
         ▶ 토론 시작
       </button>
+      <button id="resetBtn"
+              class="w-full mt-2 py-2 bg-white border border-slate-300 text-slate-600
+                     text-sm font-bold rounded hover:bg-slate-100">
+        ↺ 초기화 (처음부터 다시)
+      </button>
     </aside>
 
-    <!-- ===== 토론 타임라인 + 개입 존 ===== -->
+    <!-- ===== 토론 주제 + 타임라인 + 개입 존 ===== -->
     <section class="flex-1 flex flex-col min-h-0">
+      <!-- 토론 주제 — 포스팅 영역 상단에 고정. 긴 주제문도 넓게 보고 편집한다. -->
+      <div class="border-b border-slate-200 bg-white px-5 py-3 shrink-0">
+        <label class="block text-xs font-semibold text-slate-500 mb-1">📌 토론 주제</label>
+        <textarea id="topicInput" rows="2"
+                  placeholder="토론 주제를 입력하세요 — 여러 줄, 긴 주제문도 괜찮습니다"
+                  class="w-full px-3 py-2 text-sm border border-slate-300 rounded
+                         resize-y leading-relaxed overflow-y-auto
+                         read-only:bg-slate-100 read-only:text-slate-600"
+                  style="max-height:40vh;">신규 사용자의 첫 일주일 경험을 어떻게 개선할까?</textarea>
+      </div>
       <div id="timeline" class="timeline flex-1 overflow-y-auto p-5">
         <div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">
-          좌측에서 토론을 설정하고 <b>[▶ 토론 시작]</b>을 누르세요.
+          상단에 주제를 적고 좌측에서 에이전트를 설정한 뒤 <b>[▶ 토론 시작]</b>을 누르세요.
         </div>
       </div>
 
@@ -122,22 +167,24 @@ const PHASE_LABEL = {
   phase_5_conclusion: '5단계 · 최종결론',
 };
 const PERSONA_LABEL = {
-  proponent: '찬성론자', opponent: '반대론자', fact_checker: '팩트체커',
-  mediator: '중재자', analyst: '분석가', neutral: '중립',
+  ideator: '아이디어 발상가', builder: '아이디어 확장가', critic: '비판적 검토자',
+  synthesizer: '통합·정리자', pragmatist: '실용성 검토자', neutral: '자유 참여자',
   consensus: '합의 조정', warning: '응답 실패',
+  proponent: '찬성론자', opponent: '반대론자', fact_checker: '팩트체커',
+  mediator: '중재자', analyst: '분석가',
 };
 const PROVIDERS = [['openai', 'OpenAI'], ['anthropic', 'Anthropic'],
                    ['ollama', 'Ollama'], ['manual', 'Manual Tunnel']];
-const PTYPES = [['proponent', '찬성론자'], ['opponent', '반대론자'],
-                ['fact_checker', '팩트체커'], ['mediator', '중재자'],
-                ['analyst', '분석가'], ['neutral', '중립']];
+const PTYPES = [['ideator', '아이디어 발상가'], ['builder', '아이디어 확장가'],
+                ['critic', '비판적 검토자'], ['synthesizer', '통합·정리자'],
+                ['pragmatist', '실용성 검토자'], ['neutral', '자유 참여자']];
 const PRESETS = [
-  { name: '지지자', provider: 'openai', model: 'gpt-4o-mini', ptype: 'proponent',
-    persona: '원격근무를 적극 지지하는 토론자. 자율성과 깊은 몰입의 가치를 강조한다.' },
-  { name: '회의론자', provider: 'openai', model: 'gpt-4o-mini', ptype: 'opponent',
-    persona: '원격근무에 회의적인 토론자. 협업 손실과 소속감 약화를 우려한다.' },
-  { name: '팩트체커', provider: 'openai', model: 'gpt-4o-mini', ptype: 'fact_checker',
-    persona: '데이터와 근거를 중시하는 팩트체커. 양측 주장의 사실 여부를 검증한다.' },
+  { name: '발상가', provider: 'openai', model: 'gpt-4o-mini', ptype: 'ideator',
+    persona: '제약 없이 새로운 아이디어를 빠르게 쏟아내는 발상가. 엉뚱하더라도 선택지를 먼저 늘린다.' },
+  { name: '확장가', provider: 'openai', model: 'gpt-4o-mini', ptype: 'builder',
+    persona: "다른 참가자의 아이디어에 '예, 그리고'로 살을 붙여 키우는 확장가. 좋은 씨앗을 구체화한다." },
+  { name: '검토자', provider: 'openai', model: 'gpt-4o-mini', ptype: 'critic',
+    persona: '아이디어의 약점과 빠진 관점을 건설적으로 짚는 검토자. 깎아내리지 않고 더 단단하게 만든다.' },
 ];
 
 // ---- 전역 상태 -------------------------------------------------------------
@@ -158,6 +205,16 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = (s == null) ? '' : String(s);
   return d.innerHTML;
+}
+// 마크다운 포스팅을 안전한 HTML 로 렌더링한다. marked 로 파싱하고 DOMPurify 로
+// XSS 를 차단하므로 LLM·복붙 응답을 innerHTML 로 넣어도 안전하다. 라이브러리가
+// 로드되지 않았으면(오프라인 등) 평문 이스케이프로 폴백한다.
+function renderMarkdown(text) {
+  const src = (text == null) ? '' : String(text);
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+    return escapeHtml(src);
+  }
+  return DOMPurify.sanitize(marked.parse(src));
 }
 function scrollTimeline() { timelineEl.scrollTop = timelineEl.scrollHeight; }
 function phaseLabel(p) { return PHASE_LABEL[p] || p; }
@@ -195,8 +252,13 @@ function addAgentSlot(preset) {
     <input class="a-model w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
            placeholder="모델명 (예: gpt-4o-mini)" value="${escapeHtml(preset.model)}" />
     <textarea class="a-persona w-full px-2 py-1 text-sm border border-slate-300 rounded"
-              rows="2" placeholder="페르소나 프롬프트">${escapeHtml(preset.persona)}</textarea>`;
+              rows="2" placeholder="페르소나 프롬프트 — 대강 써도 됩니다">${escapeHtml(preset.persona)}</textarea>
+    <button class="a-refine w-full mt-1 text-[11px] py-1 rounded bg-violet-600 text-white
+                   font-semibold hover:bg-violet-700 disabled:bg-slate-300">
+      ✨ 주제에 맞춰 페르소나 윤문
+    </button>`;
   slot.querySelector('.del-slot').addEventListener('click', () => slot.remove());
+  slot.querySelector('.a-refine').addEventListener('click', () => refinePersona(slot));
   $('agentSlots').appendChild(slot);
 }
 
@@ -220,6 +282,44 @@ function collectAgents() {
   return agents;
 }
 
+// 페르소나 초안을 토론 주제 맥락에 맞춰 윤문한다 (해당 슬롯의 provider/model 사용).
+async function refinePersona(slot) {
+  const topic = $('topicInput').value.trim();
+  const draft = slot.querySelector('.a-persona').value.trim();
+  const provider = slot.querySelector('.a-provider').value;
+  const model = slot.querySelector('.a-model').value.trim() || 'gpt-4o-mini';
+  if (!topic) { alert('먼저 토론 주제를 입력하세요.'); return; }
+  if (!draft) { alert('윤문할 페르소나 초안을 먼저 입력하세요. (대강 써도 됩니다)'); return; }
+  if (provider === 'manual') {
+    alert('manual 슬롯은 윤문할 수 없습니다. OpenAI/Anthropic/Ollama 슬롯에서 시도하세요.');
+    return;
+  }
+  const btn = slot.querySelector('.a-refine');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '✨ 윤문 중…';
+  try {
+    const res = await fetch('/personas/refine', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        topic: topic, draft: draft, provider: provider, model: model,
+        name: slot.querySelector('.a-name').value.trim(),
+        persona_type: slot.querySelector('.a-ptype').value,
+      }),
+    });
+    if (!res.ok) throw new Error('윤문 실패: ' + res.status + ' ' + (await res.text()));
+    const data = await res.json();
+    slot.querySelector('.a-persona').value = data.refined || draft;
+    btn.textContent = '✓ 윤문 완료';
+    setTimeout(() => { btn.textContent = orig; }, 1800);
+  } catch (e) {
+    alert(e.message);
+    btn.textContent = orig;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---- 토론 시작 + WebSocket 연결 --------------------------------------------
 async function startDiscussion() {
   const topic = $('topicInput').value.trim();
@@ -235,6 +335,7 @@ async function startDiscussion() {
     });
     if (!res.ok) throw new Error('토론 생성 실패: ' + res.status + ' ' + (await res.text()));
     discussionId = (await res.json()).discussion_id;
+    $('topicInput').readOnly = true;   // 토론 시작 후 주제는 고정 — 읽기 전용
     timelineEl.innerHTML = '';
     bubbles = {};
     wsReconnectAttempts = 0;
@@ -245,6 +346,26 @@ async function startDiscussion() {
     alert(e.message);
     $('startBtn').disabled = false;
   }
+}
+
+// 진행 중이던 토론 연결을 끊고 UI 를 시작 전 상태로 되돌린다 (설정 폼은 유지).
+function resetDiscussion() {
+  discussionId = null;   // scheduleReconnect 가 즉시 멈추도록 가장 먼저 비운다
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  wsReconnectAttempts = 0;
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  bubbles = {};
+  agentsById = {};
+  lastCompletedPhase = null;
+  timelineEl.innerHTML =
+    '<div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">'
+    + '상단에 주제를 적고 좌측에서 에이전트를 설정한 뒤 '
+    + '<b>[▶ 토론 시작]</b>을 누르세요.</div>';
+  hideInterventionBar();
+  $('interventionInput').value = '';
+  $('topicInput').readOnly = false;   // 다시 편집 가능 상태로
+  $('startBtn').disabled = false;
+  setStatus('대기 중', '');
 }
 
 function connectWS(id) {
@@ -361,8 +482,10 @@ function finalizeTurn(turn) {
   const b = ensureBubble(turn.phase, turn.agent_id);
   const mp = b.wrap.querySelector('.manual-panel');
   if (mp) mp.remove();   // 수동 응답 확정 — 복붙 패널 제거
-  b.body.textContent = turn.content || '';
-  b.body.classList.remove('streaming');
+  // 확정된 포스팅은 마크다운으로 렌더링한다 (스트리밍 중에는 평문 그대로).
+  b.body.innerHTML = renderMarkdown(turn.content || '');
+  b.body.classList.remove('streaming', 'whitespace-pre-wrap');
+  b.body.classList.add('md');
   b.streaming = false;
   const failed = (turn.metadata && turn.metadata.failed)
               || (turn.content || '').startsWith('[시스템 경고');
@@ -396,8 +519,8 @@ function renderAgreement(text) {
   div.className = 'bubble bubble--consensus rounded-lg p-4 my-3';
   div.innerHTML =
     `<div class="text-sm font-bold text-teal-700 mb-1">🤝 최종 합의안 (force_consensus)</div>`
-    + `<div class="text-sm text-slate-800 whitespace-pre-wrap leading-relaxed">`
-    + escapeHtml(text) + `</div>`;
+    + `<div class="text-sm text-slate-800 leading-relaxed md">`
+    + renderMarkdown(text) + `</div>`;
   timelineEl.appendChild(div);
   scrollTimeline();
 }
@@ -408,7 +531,7 @@ function renderIntervention(iv) {
   div.className = 'bubble--hint rounded-lg p-3 my-2';
   div.innerHTML =
     `<div class="text-xs font-bold text-amber-700 mb-1">🙋 참가자 H 개입</div>`
-    + `<div class="text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(iv.message)}</div>`;
+    + `<div class="text-sm text-slate-800 md">${renderMarkdown(iv.message)}</div>`;
   timelineEl.appendChild(div);
   scrollTimeline();
 }
@@ -552,6 +675,8 @@ function renderSnapshot(state) {
   agentsById = {};
   (state.agents || []).forEach((a) => { agentsById[a.agent_id] = a; });
   if (state.topic) $('topicInput').value = state.topic;
+  $('topicInput').readOnly = true;   // 스냅샷이 있다 = 진행 중인 토론 — 주제 고정
+  autoGrowTopic();
 
   PHASE_ORDER.forEach((phase) => {
     (state[PHASE_FIELD[phase]] || []).forEach((turn) => finalizeTurn(turn));
@@ -660,12 +785,24 @@ function onCompleted(payload) {
   $('startBtn').disabled = false;
 }
 
+// 토론 주제 textarea 를 내용 높이에 맞춰 키운다 (최대 40vh, 초과 시 스크롤).
+function autoGrowTopic() {
+  const el = $('topicInput');
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, window.innerHeight * 0.4) + 'px';
+}
+
 // ---- 초기화 ----------------------------------------------------------------
+// 마크다운: 단일 줄바꿈도 <br> 로(LLM 출력 특성), GitHub 표·취소선 등 지원.
+if (typeof marked !== 'undefined') marked.setOptions({ breaks: true, gfm: true });
 PRESETS.forEach(addAgentSlot);
 $('addSlotBtn').addEventListener('click', () => addAgentSlot());
 $('startBtn').addEventListener('click', startDiscussion);
+$('resetBtn').addEventListener('click', resetDiscussion);
 $('postBtn').addEventListener('click', postIntervention);
 $('skipBtn').addEventListener('click', skipPhase);
+$('topicInput').addEventListener('input', autoGrowTopic);
+autoGrowTopic();   // 기본 주제 텍스트에 맞춰 초기 높이 조정
 </script>
 </body>
 </html>

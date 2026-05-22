@@ -73,6 +73,7 @@ app = FastAPI(
 )
 
 app.include_router(discussion.router)
+app.include_router(discussion.tools_router)
 
 
 @app.get("/", response_class=HTMLResponse, tags=["ui"], include_in_schema=False)

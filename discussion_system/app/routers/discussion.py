@@ -29,6 +29,9 @@ from ..schemas import (
     DiscussionState,
     DiscussionStatus,
     ManualResponseRequest,
+    ModelProvider,
+    RefinePersonaRequest,
+    RefinePersonaResponse,
     UserIntervention,
     WSMessage,
     WSMessageType,
@@ -37,6 +40,9 @@ from ..schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/discussions", tags=["discussion"])
+
+#: 특정 토론에 속하지 않는 보조 도구 엔드포인트 (페르소나 윤문 등) — prefix 없음.
+tools_router = APIRouter(tags=["tools"])
 
 
 class SocketRegistry:
@@ -172,6 +178,41 @@ async def submit_manual_response(
          "content": req.content},
     )
     return {"status": "manual_response_accepted", "discussion_id": discussion_id}
+
+
+# ---------------------------------------------------------------------------
+# 보조 도구 엔드포인트 (페르소나 윤문)
+# ---------------------------------------------------------------------------
+@tools_router.post("/personas/refine", response_model=RefinePersonaResponse)
+async def refine_persona(
+    req: RefinePersonaRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator),
+) -> RefinePersonaResponse:
+    """페르소나 초안을 토론 주제에 맞춰 윤문한다.
+
+    윤문은 요청에 담긴 provider/model(보통 해당 에이전트 슬롯 설정)로 수행한다.
+    manual 공급자는 호출할 API 가 없으므로 거부한다(400).
+    """
+    if req.provider is ModelProvider.MANUAL:
+        raise HTTPException(
+            status_code=400,
+            detail="manual 슬롯은 윤문할 수 없습니다. "
+                   "OpenAI/Anthropic/Ollama 슬롯에서 시도하세요.",
+        )
+    try:
+        refined = await orchestrator.refine_persona(
+            topic=req.topic,
+            draft=req.draft,
+            provider=req.provider,
+            model=req.model,
+            name=req.name,
+            persona_role=req.persona_type.value if req.persona_type else "",
+        )
+    except Exception as exc:  # noqa: BLE001 - LLM 호출 실패를 502 로 변환
+        raise HTTPException(status_code=502, detail=f"윤문 실패: {exc}") from exc
+    if not refined:
+        raise HTTPException(status_code=502, detail="윤문 결과가 비어 있습니다.")
+    return RefinePersonaResponse(refined=refined)
 
 
 # ---------------------------------------------------------------------------
