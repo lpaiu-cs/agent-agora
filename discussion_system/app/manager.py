@@ -24,7 +24,17 @@ from enum import Enum
 from typing import Optional
 
 from . import database
-from .formats import PHASE_COMPLETED, DiscussionFormat, get_format
+from .formats import (
+    PHASE_COMPLETED,
+    PHASE_IDLE,
+    DiscussionFormat,
+    PhaseSpec,
+    get_format,
+    phase_key,
+    phase_of_key,
+    plan_next,
+    round_of_key,
+)
 from .schemas import (
     AgentConfig,
     AgentStanceSummary,
@@ -122,6 +132,42 @@ _PERSONA_ROLE_HINTS: dict[PersonaType, str] = {
 def _format_of(state: DiscussionState) -> DiscussionFormat:
     """토론 상태에 지정된 형식을 반환한다 (미지의 id 면 기본 형식)."""
     return get_format(state.format_id)
+
+
+def _instance_label(spec: Optional[PhaseSpec], round_no: int) -> str:
+    """단계 인스턴스의 표시 라벨. 반복 단계면 '· N라운드' 를 덧붙인다."""
+    if spec is None:
+        return "?"
+    return f"{spec.label} · {round_no}라운드" if spec.repeatable else spec.label
+
+
+def _instances_in_order(
+    fmt: DiscussionFormat, state: DiscussionState
+) -> list[tuple[PhaseSpec, int, str]]:
+    """phase_records 에 실제로 나타난 단계 인스턴스를 (스펙, 라운드, 키) 로 반환한다.
+
+    형식의 단계 순서를 따르되, 반복 단계는 기록에 존재하는 라운드만 오름차순으로
+    펼친다. 비반복 단계는 단일 인스턴스(라운드 1). 아직 시작 안 한 단계는 제외.
+    """
+    out: list[tuple[PhaseSpec, int, str]] = []
+    for spec in fmt.phases:
+        if spec.repeatable:
+            rounds = sorted(
+                round_of_key(k) for k in state.phase_records
+                if phase_of_key(k) == spec.id
+            )
+            out.extend((spec, r, phase_key(spec, r)) for r in rounds)
+        elif spec.id in state.phase_records:
+            out.append((spec, 1, spec.id))
+    return out
+
+
+def _latest_convergence(state: DiscussionState, instance_key: str) -> float:
+    """주어진 단계 인스턴스의 합의 근접도. 요약이 없으면 0.0."""
+    for summary in state.phase_summaries:
+        if summary.phase == instance_key:
+            return summary.convergence_score
+    return 0.0
 
 
 # ===========================================================================
@@ -350,7 +396,7 @@ def _render_phase_summary(
     """단계 요약 메트릭스(LTM)를 경량 텍스트로 렌더링한다."""
     name_of = {a.agent_id: a.name for a in state.agents}
     spec = _format_of(state).phase(phase)
-    label = spec.label if spec else phase
+    label = _instance_label(spec, round_of_key(phase))
     lines = [f"== {label} [요약 메트릭스 · LTM] =="]
     for st in summary.agent_summaries:
         speaker = name_of.get(st.agent_id, st.agent_id)
@@ -370,19 +416,19 @@ def _render_phase_summary(
 
 def _render_history(
     state: DiscussionState,
-    current_phase: str,
+    current_key: str,
     prior_turns: list[AgentTurn],
     force_full: bool = False,
 ) -> str:
-    """이전 단계 발언 + 유저 개입 + (순차) 선행 의견을 텍스트로 렌더링한다.
+    """이전 단계 인스턴스 발언 + 유저 개입 + (순차) 선행 의견을 렌더링한다.
 
-    콘텍스트 압축(LTM): 최근 2개 단계를 제외한 더 오래된 단계는 원본 로그 대신
-    ``phase_summaries`` 의 요약 메트릭스를 경량 주입한다. ``force_full=True`` 이면
+    가변 길이 형식에서는 단계 인스턴스(반복 단계의 라운드 포함)를 실행 순서대로
+    펼친다. 콘텍스트 압축(LTM): 최근 2개 인스턴스를 제외한 더 오래된 것은 원본
+    로그 대신 ``phase_summaries`` 요약을 경량 주입한다. ``force_full=True`` 이면
     압축을 끈다.
     """
     name_of = {a.agent_id: a.name for a in state.agents}
     summary_of = {s.phase: s for s in state.phase_summaries}
-    fmt = _format_of(state)
     lines: list[str] = []
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
@@ -390,25 +436,28 @@ def _render_history(
         lines.append("== 진행자 사전 지시 ==")
         lines.extend(f"[참가자 H] {iv.message}" for iv in pre)
 
-    current_idx = fmt.phase_index(current_phase)
-    if current_idx < 0:
-        current_idx = len(fmt.phases)   # 'completed' 등 — 모든 단계가 과거
-    for past_idx, spec in enumerate(fmt.phases[:current_idx]):
-        is_recent = past_idx >= current_idx - 2   # 최근 2개 단계는 원본 유지
-        if not force_full and not is_recent and spec.id in summary_of:
-            lines.append(
-                _render_phase_summary(state, spec.id, summary_of[spec.id]))
+    # 현재 인스턴스 직전까지가 '과거' — 현재 라운드 동석 발언은 prior_turns 로 받는다.
+    past: list[tuple[PhaseSpec, int, str]] = []
+    for spec, rnd, key in _instances_in_order(_format_of(state), state):
+        if key == current_key:
+            break
+        past.append((spec, rnd, key))
+
+    for idx, (spec, rnd, key) in enumerate(past):
+        is_recent = idx >= len(past) - 2   # 최근 2개 인스턴스는 원본 유지
+        label = _instance_label(spec, rnd)
+        if not force_full and not is_recent and key in summary_of:
+            lines.append(_render_phase_summary(state, key, summary_of[key]))
         else:
-            turns = state.record_for_phase(spec.id)
+            turns = state.record_for_phase(key)
             if turns:
-                lines.append(f"== {spec.label} ==")
+                lines.append(f"== {label} ==")
                 for turn in turns:
                     speaker = name_of.get(turn.agent_id, turn.agent_id)
                     lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions
-                 if iv.after_phase == spec.id]
+        after = [iv for iv in state.user_interventions if iv.after_phase == key]
         if after:
-            lines.append(f"-- {spec.label} 이후 진행자 개입 --")
+            lines.append(f"-- {label} 이후 진행자 개입 --")
             lines.extend(f"[참가자 H] {iv.message}" for iv in after)
 
     if prior_turns:
@@ -421,24 +470,32 @@ def _render_history(
 
 def _render_delta(
     state: DiscussionState,
-    current_phase: str,
+    current_key: str,
     prior_turns: list[AgentTurn],
 ) -> str:
-    """직전 단계 발언 + 그 직후 진행자 개입 + (순차) 이번 단계 선행 의견만."""
+    """직전 단계 인스턴스 발언 + 그 직후 진행자 개입 + (순차) 이번 선행 의견만."""
     name_of = {a.agent_id: a.name for a in state.agents}
-    fmt = _format_of(state)
+    instances = _instances_in_order(_format_of(state), state)
+    keys = [k for _, _, k in instances]
+    prev: Optional[tuple[PhaseSpec, int, str]] = None
+    if current_key in keys:
+        idx = keys.index(current_key)
+        if idx >= 1:
+            prev = instances[idx - 1]
+    elif instances:
+        prev = instances[-1]   # 현재 인스턴스가 아직 기록 전 — 마지막 과거가 직전
+
     lines: list[str] = []
-    current_idx = fmt.phase_index(current_phase)
-    if current_idx >= 1:
-        prev = fmt.phases[current_idx - 1]
-        turns = state.record_for_phase(prev.id)
+    if prev is not None:
+        spec, rnd, key = prev
+        turns = state.record_for_phase(key)
         if turns:
-            lines.append(f"== 직전 단계({prev.label}) 신규 발언 ==")
+            lines.append(
+                f"== 직전 단계({_instance_label(spec, rnd)}) 신규 발언 ==")
             for turn in turns:
                 speaker = name_of.get(turn.agent_id, turn.agent_id)
                 lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions
-                 if iv.after_phase == prev.id]
+        after = [iv for iv in state.user_interventions if iv.after_phase == key]
         if after:
             lines.append("-- 직후 진행자 개입 --")
             lines.extend(f"[참가자 H] {iv.message}" for iv in after)
@@ -468,6 +525,11 @@ def _build_prompt(
     if role_hint:
         system += f"\n\n[너의 역할]\n{role_hint}"
     instruction = spec.instruction if spec else f"[{phase}] 단계 작업을 수행하라."
+    if spec and spec.repeatable:
+        instruction += (
+            f"\n(지금은 {round_of_key(phase)}라운드다 — 앞 라운드의 문답을 "
+            "딛고 논점을 더 좁혀라.)"
+        )
     if spec and spec.sequential and prior_turns:
         instruction = f"{instruction}\n\n{_SEQUENTIAL_REVISION_HINT}"
     history = _render_history(state, phase, prior_turns, force_full=force_full)
@@ -554,15 +616,15 @@ def render_transcript(state: DiscussionState) -> str:
         lines += ["", "## 진행자 사전 지시", ""]
         lines += [f"> {iv.message}" for iv in pre]
 
-    for spec in fmt.phases:
-        turns = state.phase_records.get(spec.id, [])
+    for spec, rnd, key in _instances_in_order(fmt, state):
+        turns = state.phase_records.get(key, [])
         if not turns:
             continue
-        lines += ["", f"## {spec.label}", ""]
+        lines += ["", f"## {_instance_label(spec, rnd)}", ""]
         for turn in turns:
             speaker = name_of.get(turn.agent_id, turn.agent_id)
             lines += [f"### {speaker}", "", turn.content, ""]
-        summary = summary_of.get(spec.id)
+        summary = summary_of.get(key)
         if summary:
             lines.append(
                 f"_단계 요약 · 합의 근접도 {summary.convergence_score:.0%}_")
@@ -570,7 +632,7 @@ def render_transcript(state: DiscussionState) -> str:
                 lines.append(
                     f"_주요 쟁점: {' · '.join(summary.key_conflicts)}_")
         for iv in state.user_interventions:
-            if iv.after_phase == spec.id:
+            if iv.after_phase == key:
                 lines.append(f"> 진행자 개입: {iv.message}")
 
     if state.final_joint_agreement:
@@ -647,15 +709,20 @@ class Orchestrator:
             raise DiscussionError(f"토론 {discussion_id} 를 찾을 수 없습니다.")
 
         if event is PipelineEvent.START:
-            await self._run_phase(discussion_id, _format_of(state).first_phase.id)
+            first = plan_next(_format_of(state), PHASE_IDLE)
+            if first is not None:
+                await self._run_phase(discussion_id, first)
         elif event is PipelineEvent.ADVANCE:
             if state.status is not DiscussionStatus.WAITING_FOR_USER:
                 raise InvalidStateTransition(
                     f"advance 는 WAITING_FOR_USER 에서만 가능 (현재 {state.status.value})"
                 )
-            nxt = _format_of(state).next_phase(state.current_phase)
+            nxt = plan_next(
+                _format_of(state), state.current_phase,
+                _latest_convergence(state, state.current_phase),
+            )
             if nxt is not None:
-                await self._run_phase(discussion_id, nxt.id)
+                await self._run_phase(discussion_id, nxt)
         elif event is PipelineEvent.MANUAL_RESPONSE:
             await self._on_manual_response(state, payload or {})
         elif event is PipelineEvent.REVIEW_QUESTION:
@@ -949,10 +1016,19 @@ class Orchestrator:
 
     # ----- 단계 실행 -----
     async def _run_phase(self, discussion_id: str, phase: str) -> None:
-        """단계 진입 — status RUNNING 마킹 후 진행 가능한 데까지 수행한다."""
-        await self._commit(discussion_id, lambda s: _mark_phase_start(s, phase))
-        await self._emit(discussion_id, WSMessageType.PHASE_STARTED,
-                         {"phase": phase})
+        """단계 인스턴스 진입 — status RUNNING 마킹 후 가능한 데까지 진행한다.
+
+        ``phase`` 는 단계 인스턴스 키 — 반복 단계면 ``'probe#3'`` 처럼 라운드를
+        담는다(비반복 단계는 순수 id).
+        """
+        state = await self._commit(
+            discussion_id, lambda s: _mark_phase_start(s, phase))
+        spec = _format_of(state).phase(phase)
+        await self._emit(
+            discussion_id, WSMessageType.PHASE_STARTED,
+            {"phase": phase, "round": round_of_key(phase),
+             "label": _instance_label(spec, round_of_key(phase))},
+        )
         await self._advance_phase_progress(discussion_id, phase)
 
     async def _advance_phase_progress(
@@ -970,7 +1046,9 @@ class Orchestrator:
 
         fmt = _format_of(state)
         spec = fmt.phase(phase)
-        if (spec is not None and fmt.is_last_phase(phase)
+        # 합의안 합성은 '비반복' 마지막 단계에서만 — 반복 단계는 매 라운드가
+        # 마지막 스펙이 아니므로 is_last_phase 만으로는 부족하다.
+        if (spec is not None and not spec.repeatable and fmt.is_last_phase(phase)
                 and fmt.supports_consensus and state.force_consensus):
             await self._run_consensus(discussion_id, phase)
             return
@@ -1108,13 +1186,18 @@ class Orchestrator:
         return _split_reasoning_draft(content)
 
     async def _finish_phase(self, discussion_id: str, phase: str) -> None:
-        """단계 종료 — 요약 생성 -> 게이트(WAITING) 또는 토론 종료(COMPLETED)."""
+        """단계 인스턴스 종료 — 요약 생성 -> 게이트(WAITING) 또는 종료(COMPLETED).
+
+        다음 인스턴스는 ``plan_next`` 가 결정한다 — 정적 형식이면 다음 단계, 반복
+        단계면 합의 근접도에 따라 같은 단계의 다음 라운드 또는 후속 단계.
+        """
         state = await self._load(discussion_id)
         if state is None:
             return
+        fmt = _format_of(state)
         summary = await self._summarize_phase(state, phase,
                                               list(state.record_for_phase(phase)))
-        nxt = _format_of(state).next_phase(phase)
+        nxt = plan_next(fmt, phase, summary.convergence_score)
 
         def mutate(s: DiscussionState) -> None:
             if not any(ps.phase == phase for ps in s.phase_summaries):
@@ -1140,8 +1223,13 @@ class Orchestrator:
                  "final_joint_agreement": state.final_joint_agreement},
             )
         else:
-            await self._emit(discussion_id, WSMessageType.AWAITING_USER,
-                             {"completed_phase": phase})
+            nxt_spec = fmt.phase(nxt)
+            await self._emit(
+                discussion_id, WSMessageType.AWAITING_USER,
+                {"completed_phase": phase, "next_phase": nxt,
+                 "next_round": round_of_key(nxt),
+                 "next_label": _instance_label(nxt_spec, round_of_key(nxt))},
+            )
 
     async def _end_discussion(self, discussion_id: str) -> None:
         """게이트 구간에서 토론을 조기 종료한다 — 남은 단계는 진행하지 않는다.

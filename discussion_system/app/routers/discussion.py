@@ -342,7 +342,11 @@ async def list_formats() -> dict:
                 "name": fmt.name,
                 "description": fmt.description,
                 "supports_consensus": fmt.supports_consensus,
-                "phases": [{"id": p.id, "label": p.label} for p in fmt.phases],
+                "phases": [
+                    {"id": p.id, "label": p.label, "repeatable": p.repeatable,
+                     "min_rounds": p.min_rounds, "max_rounds": p.max_rounds}
+                    for p in fmt.phases
+                ],
             }
             for fmt in FORMATS.values()
         ]

@@ -141,6 +141,61 @@ async def test_brainstorm_format_runs_its_four_phases(
     assert set(st.phase_records) == {"diverge", "expand", "converge", "action"}
 
 
+async def test_socratic_probe_stops_at_min_rounds_when_converged(
+    orchestrator, make_state, patch_llm,
+):
+    """socratic 가변 길이 — 합의 근접도가 높으면 문답 라운드가 최소 라운드에서 멈춘다."""
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        # 요약 호출이 JSON 을 파싱할 수 있도록 — 합의 근접도 0.95(>= 0.8 임계).
+        return json.dumps({"agent_summaries": [], "key_conflicts": [],
+                           "convergence_score": 0.95})
+
+    patch_llm(fake)
+    await database.insert_state(
+        make_state(discussion_id="soc", format_id="socratic"))
+
+    await orchestrator.process_event("soc", PipelineEvent.START)
+    for _ in range(12):   # 라운드 수보다 넉넉한 상한
+        st = await database.load_state("soc")
+        if st.status is not DiscussionStatus.WAITING_FOR_USER:
+            break
+        await orchestrator.process_event("soc", PipelineEvent.ADVANCE)
+
+    st = await database.load_state("soc")
+    assert st.status is DiscussionStatus.COMPLETED
+    assert st.current_phase == "completed"
+    # 근접도 0.95 ≥ 0.8 이지만 min_rounds=2 라 probe 는 2라운드까지만.
+    assert set(st.phase_records) == {
+        "position", "probe#1", "probe#2", "synthesis"}
+
+
+async def test_socratic_probe_caps_at_max_rounds_when_not_converging(
+    orchestrator, make_state, patch_llm,
+):
+    """socratic 가변 길이 — 합의가 안 되면 문답 라운드가 max_rounds 상한에서 멈춘다."""
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        return json.dumps({"agent_summaries": [], "key_conflicts": [],
+                           "convergence_score": 0.1})
+
+    patch_llm(fake)
+    await database.insert_state(
+        make_state(discussion_id="soc2", format_id="socratic"))
+
+    await orchestrator.process_event("soc2", PipelineEvent.START)
+    for _ in range(15):
+        st = await database.load_state("soc2")
+        if st.status is not DiscussionStatus.WAITING_FOR_USER:
+            break
+        await orchestrator.process_event("soc2", PipelineEvent.ADVANCE)
+
+    st = await database.load_state("soc2")
+    assert st.status is DiscussionStatus.COMPLETED
+    # 근접도 0.1 — 6라운드(max_rounds)까지 반복 후 종합 단계로.
+    probe_rounds = {k for k in st.phase_records if k.startswith("probe#")}
+    assert probe_rounds == {f"probe#{n}" for n in range(1, 7)}
+    assert {"position", "synthesis"} <= set(st.phase_records)
+
+
 async def test_end_event_completes_discussion_at_gate(
     orchestrator, make_state, patch_llm,
 ):
