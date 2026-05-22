@@ -72,6 +72,7 @@
           class="ml-auto text-xs px-3 py-1 rounded-full bg-slate-700 text-slate-200">
       대기 중
     </span>
+    <span id="usagePill" class="text-xs text-slate-400"></span>
     <button id="exportBtn"
             class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
                    text-slate-200">📄 텍스트 저장</button>
@@ -195,6 +196,7 @@ let bubbles = {};          // `${phase}__${agentId}` -> { wrap, body, ptype, str
 let lastCompletedPhase = null;
 let wsReconnectAttempts = 0;   // WebSocket 지수 백오프 재연결 시도 횟수
 let wsReconnectTimer = null;   // 예약된 재연결 타이머 핸들
+let usageTotal = 0;            // 누적 토큰 사용량 (에이전트 발언 기준)
 
 // ---- DOM 핸들 --------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -230,6 +232,12 @@ function setStatus(text, kind) {
                    error: 'bg-rose-600', run: 'bg-sky-600' };
   pill.className = 'ml-auto text-xs px-3 py-1 rounded-full text-white '
                  + (colors[kind] || 'bg-slate-600');
+}
+
+// 누적 토큰 사용량을 헤더에 표시한다 (에이전트 발언 기준 합계).
+function updateUsagePill() {
+  $('usagePill').textContent =
+    usageTotal ? ('🪙 ' + usageTotal.toLocaleString() + ' 토큰') : '';
 }
 
 // ---- 세팅 존: 에이전트 슬롯 -------------------------------------------------
@@ -376,6 +384,8 @@ function resetDiscussion() {
   bubbles = {};
   agentsById = {};
   lastCompletedPhase = null;
+  usageTotal = 0;
+  updateUsagePill();
   timelineEl.innerHTML =
     '<div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">'
     + '상단에 주제를 적고 좌측에서 에이전트를 설정한 뒤 '
@@ -545,6 +555,9 @@ function finalizeTurn(turn) {
       header.appendChild(badge);
     }
   }
+  const used = (turn.metadata || {}).usage || {};
+  usageTotal += (used.prompt_tokens || 0) + (used.completion_tokens || 0);
+  updateUsagePill();
   scrollTimeline();
 }
 
@@ -874,6 +887,7 @@ function renderSnapshot(state) {
   autoGrowTopic();
   currentFormatId = state.format_id || 'debate';   // 단계 렌더링의 기준 형식
 
+  usageTotal = 0;   // 스냅샷 재구성 — 누적 사용량을 0 부터 다시 합산한다
   const fmtPhases = (formatsById[currentFormatId] || {}).phases || [];
   fmtPhases.forEach((p) => {
     ((state.phase_records || {})[p.id] || []).forEach((turn) => finalizeTurn(turn));

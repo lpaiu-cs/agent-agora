@@ -95,6 +95,28 @@ async def test_recover_reruns_running_and_preserves_pending(
     assert pend_after.status is DiscussionStatus.PENDING_MANUAL_INPUT   # 보존
 
 
+async def test_token_usage_recorded_in_turn_metadata(
+    orchestrator, make_state, patch_llm,
+):
+    """LLM 호출의 토큰 사용량이 발언 메타데이터에 기록되고 기록 문서에 합산된다."""
+    from app.manager import render_transcript
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        return ("테스트 발언.", {"prompt_tokens": 10, "completion_tokens": 20})
+
+    patch_llm(fake)
+    await database.insert_state(make_state(discussion_id="usage"))
+    await orchestrator.process_event("usage", PipelineEvent.START)
+
+    st = await database.load_state("usage")
+    turns = st.phase_records.get("opinion", [])
+    assert turns
+    assert turns[0].metadata.get("usage") == {
+        "prompt_tokens": 10, "completion_tokens": 20}
+    # 기록 문서(내보내기)에 토큰 합계가 들어간다
+    assert "토큰" in render_transcript(st)
+
+
 async def test_brainstorm_format_runs_its_four_phases(
     orchestrator, make_state, patch_llm,
 ):

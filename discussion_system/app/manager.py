@@ -189,8 +189,8 @@ class LLMClientPool:
 async def _call_openai(
     client: object, model: str, system: str, user: str,
     temperature: float, max_tokens: int, on_token: Optional[TokenCallback],
-) -> str:
-    """OpenAI Chat Completions 스트리밍 호출. 누적 텍스트를 반환."""
+) -> tuple[str, dict]:
+    """OpenAI Chat Completions 스트리밍 호출. (누적 텍스트, 토큰 사용량) 반환."""
     stream = await client.chat.completions.create(  # type: ignore[attr-defined]
         model=model,
         messages=[
@@ -198,9 +198,15 @@ async def _call_openai(
             {"role": "user", "content": user},
         ],
         temperature=temperature, max_tokens=max_tokens, stream=True,
+        stream_options={"include_usage": True},
     )
     parts: list[str] = []
+    usage: dict = {}
     async for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = {"prompt_tokens": chunk_usage.prompt_tokens,
+                     "completion_tokens": chunk_usage.completion_tokens}
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta.content
@@ -208,15 +214,16 @@ async def _call_openai(
             parts.append(delta)
             if on_token is not None:
                 await on_token(delta)
-    return "".join(parts).strip()
+    return "".join(parts).strip(), usage
 
 
 async def _call_anthropic(
     client: object, model: str, system: str, user: str,
     temperature: float, max_tokens: int, on_token: Optional[TokenCallback],
-) -> str:
-    """Anthropic Messages 스트리밍 호출. 누적 텍스트를 반환."""
+) -> tuple[str, dict]:
+    """Anthropic Messages 스트리밍 호출. (누적 텍스트, 토큰 사용량) 반환."""
     parts: list[str] = []
+    usage: dict = {}
     async with client.messages.stream(  # type: ignore[attr-defined]
         model=model, system=system,
         messages=[{"role": "user", "content": user}],
@@ -227,14 +234,20 @@ async def _call_anthropic(
                 parts.append(text)
                 if on_token is not None:
                     await on_token(text)
-    return "".join(parts).strip()
+        try:
+            final = await stream.get_final_message()
+            usage = {"prompt_tokens": final.usage.input_tokens,
+                     "completion_tokens": final.usage.output_tokens}
+        except Exception:  # noqa: BLE001 - 사용량 추출 실패는 비치명적
+            usage = {}
+    return "".join(parts).strip(), usage
 
 
 async def _call_ollama(
     client: object, model: str, system: str, user: str,
     temperature: float, max_tokens: int, on_token: Optional[TokenCallback],
-) -> str:
-    """로컬 Ollama 스트리밍 호출 (API Key 불필요). 누적 텍스트를 반환."""
+) -> tuple[str, dict]:
+    """로컬 Ollama 스트리밍 호출 (API Key 불필요). (누적 텍스트, 사용량) 반환."""
     stream = await client.chat(  # type: ignore[attr-defined]
         model=model,
         messages=[
@@ -245,14 +258,22 @@ async def _call_ollama(
         stream=True,
     )
     parts: list[str] = []
+    usage: dict = {}
     async for chunk in stream:
-        message = chunk["message"] if isinstance(chunk, dict) else chunk.message
-        content = message["content"] if isinstance(message, dict) else message.content
+        getter = chunk.get if isinstance(chunk, dict) else (
+            lambda k: getattr(chunk, k, None))
+        message = getter("message")
+        content = (message.get("content") if isinstance(message, dict)
+                   else getattr(message, "content", None)) if message else None
         if content:
             parts.append(content)
             if on_token is not None:
                 await on_token(content)
-    return "".join(parts).strip()
+        prompt_n, eval_n = getter("prompt_eval_count"), getter("eval_count")
+        if prompt_n is not None or eval_n is not None:
+            usage = {"prompt_tokens": prompt_n or 0,
+                     "completion_tokens": eval_n or 0}
+    return "".join(parts).strip(), usage
 
 
 def _extract_json(raw: str) -> dict:
@@ -513,10 +534,18 @@ def render_transcript(state: DiscussionState) -> str:
         f"- 상태: {state.status.value}",
         f"- 생성: {state.created_at:%Y-%m-%d %H:%M} · "
         f"갱신: {state.updated_at:%Y-%m-%d %H:%M}",
-        "",
-        "## 참여 에이전트",
-        "",
     ]
+    total_p = total_c = 0
+    for turns in state.phase_records.values():
+        for turn in turns:
+            used = (turn.metadata or {}).get("usage") or {}
+            total_p += used.get("prompt_tokens", 0)
+            total_c += used.get("completion_tokens", 0)
+    if total_p or total_c:
+        lines.append(
+            f"- 토큰(에이전트 발언): 입력 {total_p:,} · 출력 {total_c:,} "
+            f"· 합계 {total_p + total_c:,}")
+    lines += ["", "## 참여 에이전트", ""]
     lines += [f"- **{a.name}** (`{a.agent_id}`) — {a.model}" for a in state.agents]
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
@@ -1138,13 +1167,14 @@ class Orchestrator:
                      "token": token},
                 )
 
-            content = await self._invoke_agent(agent, system, user, on_token)
+            content, usage = await self._invoke_agent_usage(
+                agent, system, user, on_token)
             if not content.strip():
                 raise DiscussionError("응답이 비어 있습니다.")
             return AgentTurn(
                 agent_id=agent.agent_id, phase=phase, content=content.strip(),
                 metadata={"provider": agent.get_provider().value,
-                          "model": agent.model},
+                          "model": agent.model, "usage": usage},
             )
         except Exception as exc:  # noqa: BLE001 - 우아한 부분 실패 수용
             logger.warning("에이전트 %s 응답 실패: %r", agent.agent_id, exc)
@@ -1163,34 +1193,46 @@ class Orchestrator:
         self, agent: AgentConfig, system: str, user: str,
         on_token: Optional[TokenCallback] = None,
     ) -> str:
-        """공급자별 스트리밍 LLM 호출로 분기한다 (풀에서 클라이언트 재사용).
+        """LLM 을 호출해 응답 텍스트만 반환한다.
+
+        토큰 사용량이 필요하면 ``_invoke_agent_usage`` 를 직접 쓴다.
+        """
+        text, _usage = await self._invoke_agent_usage(
+            agent, system, user, on_token)
+        return text
+
+    async def _invoke_agent_usage(
+        self, agent: AgentConfig, system: str, user: str,
+        on_token: Optional[TokenCallback] = None,
+    ) -> tuple[str, dict]:
+        """공급자별 스트리밍 LLM 호출 — (응답 텍스트, 토큰 사용량)을 반환한다.
 
         실제 네트워크·추론 비용이 드는 ``_call_*`` 호출은 고정 크기 세마포어
-        (``self._llm_semaphore``) 안에서만 수행한다 — 토론 수백 개가 한꺼번에
-        이벤트를 발사해도 동시에 진행되는 무거운 LLM 호출 수를 엄격히 제한해,
-        CPU 폭주와 낙관적 락(StaleStateError) 경합 폭증을 막는다 (구조 검토 ② 교정).
-        모든 LLM 경로(에이전트 턴·합의안 합성·단계 요약)가 이 함수를 거치므로,
-        여기 한 곳의 세마포어가 전체 추론 동시성의 단일 통제점이 된다.
+        (``self._llm_semaphore``) 안에서만 수행한다 — 동시 LLM 호출 수를 엄격히
+        제한해 CPU 폭주와 낙관적 락 경합 폭증을 막는 단일 통제점이다.
+        ``_call_*`` 가 (text, usage) 튜플을 주면 그대로, 문자열만 주면(테스트
+        가짜 등) usage 를 빈 dict 로 본다.
         """
         provider = agent.get_provider()
         client = self._pool.get(provider)
         async with self._llm_semaphore:
             if provider is ModelProvider.OPENAI:
-                return await _call_openai(
+                result = await _call_openai(
                     client, agent.model, system, user,
-                    agent.temperature, agent.max_tokens, on_token,
-                )
-            if provider is ModelProvider.ANTHROPIC:
-                return await _call_anthropic(
+                    agent.temperature, agent.max_tokens, on_token)
+            elif provider is ModelProvider.ANTHROPIC:
+                result = await _call_anthropic(
                     client, agent.model, system, user,
-                    agent.temperature, agent.max_tokens, on_token,
-                )
-            if provider is ModelProvider.OLLAMA:
-                return await _call_ollama(
+                    agent.temperature, agent.max_tokens, on_token)
+            elif provider is ModelProvider.OLLAMA:
+                result = await _call_ollama(
                     client, agent.model, system, user,
-                    agent.temperature, agent.max_tokens, on_token,
-                )
-        raise DiscussionError(f"미지원 LLM 공급자: {provider}")
+                    agent.temperature, agent.max_tokens, on_token)
+            else:
+                raise DiscussionError(f"미지원 LLM 공급자: {provider}")
+        if isinstance(result, tuple):
+            return result[0], (result[1] or {})
+        return result, {}
 
     async def refine_persona(
         self, *, topic: str, draft: str, provider: ModelProvider,
