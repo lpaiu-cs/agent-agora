@@ -73,3 +73,13 @@ def test_refine_persona_rejects_manual_provider(client):
 def test_refine_persona_validates_required_fields(client):
     r = client.post("/personas/refine", json={"topic": "주제만 있음"})
     assert r.status_code == 422
+
+
+def test_list_formats(client):
+    r = client.get("/formats")
+    assert r.status_code == 200
+    formats = {f["id"]: f for f in r.json()["formats"]}
+    assert {"debate", "brainstorm"} <= set(formats)
+    assert [p["id"] for p in formats["brainstorm"]["phases"]] == [
+        "diverge", "expand", "converge", "action"]
+    assert formats["debate"]["supports_consensus"] is True

@@ -22,6 +22,7 @@ from fastapi import (
 )
 
 from .. import database
+from ..formats import FORMATS
 from ..manager import Orchestrator, PipelineEvent
 from ..schemas import (
     CreateDiscussionRequest,
@@ -214,6 +215,23 @@ async def refine_persona(
     if not refined:
         raise HTTPException(status_code=502, detail="윤문 결과가 비어 있습니다.")
     return RefinePersonaResponse(refined=refined)
+
+
+@tools_router.get("/formats")
+async def list_formats() -> dict:
+    """등록된 토론 형식 목록 — UI 의 형식 선택·단계 동적 렌더링에 쓰인다."""
+    return {
+        "formats": [
+            {
+                "id": fmt.id,
+                "name": fmt.name,
+                "description": fmt.description,
+                "supports_consensus": fmt.supports_consensus,
+                "phases": [{"id": p.id, "label": p.label} for p in fmt.phases],
+            }
+            for fmt in FORMATS.values()
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
