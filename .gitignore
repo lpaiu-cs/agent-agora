@@ -4,6 +4,10 @@ __pycache__/
 *$py.class
 *.egg-info/
 
+# 테스트
+.pytest_cache/
+.coverage
+
 # 가상환경
 .venv/
 venv/
