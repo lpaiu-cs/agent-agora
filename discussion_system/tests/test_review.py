@@ -85,3 +85,43 @@ async def test_non_intercepted_discussion_runs_without_review(
     st = await database.load_state("auto")
     assert st.status is not DiscussionStatus.PENDING_REVIEW
     assert st.review is None
+
+
+async def test_intercept_in_sequential_phase(
+    orchestrator, make_state, make_agent, patch_llm,
+):
+    """순차 단계(2단계 상호비판)에서의 가로채기 — 순차 분기 검토 진입 경로.
+
+    debate 2단계는 순차 단계라 _advance_phase_progress 의 순차 분기를 탄다.
+    선행 에이전트는 자동 포스팅되고, 가로채기된 후순위 에이전트만 검토로 진입한다.
+    """
+    patch_llm(_fake)
+    state = make_state(
+        discussion_id="seq",
+        agents=[make_agent("a1", "알파"), make_agent("a2", "베타")])
+    await database.insert_state(state)
+
+    # 가로채기 없이 1단계(동시)를 끝낸다
+    await orchestrator.process_event("seq", PipelineEvent.START)
+    st = await database.load_state("seq")
+    assert st.status is DiscussionStatus.WAITING_FOR_USER
+
+    # 2단계 진입 전 a2 만 가로채기로 지정
+    await orchestrator.set_intercepts("seq", ["a2"])
+    await orchestrator.process_event("seq", PipelineEvent.ADVANCE)
+
+    # 2단계(critique, 순차): a1 자동 포스팅 → a2 는 순차 분기로 검토 진입
+    st = await database.load_state("seq")
+    assert st.status is DiscussionStatus.PENDING_REVIEW
+    assert st.review is not None
+    assert st.review.agent_id == "a2"
+    assert st.review.phase == "critique"
+    assert any(t.agent_id == "a1"
+               for t in st.phase_records.get("critique", []))
+
+    # 승인 → a2 최종 발언 확정, 2단계 종료
+    await orchestrator.process_event("seq", PipelineEvent.REVIEW_APPROVE)
+    st = await database.load_state("seq")
+    assert st.review is None
+    assert any(t.agent_id == "a2" for t in st.phase_records["critique"])
+    assert st.status is DiscussionStatus.WAITING_FOR_USER
