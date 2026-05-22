@@ -99,6 +99,22 @@ def test_export_unknown_discussion_returns_404(client):
     assert client.get("/discussions/does-not-exist/export").status_code == 404
 
 
+def test_archive_discussion(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGORA_ARCHIVE_DIR", str(tmp_path))
+    did = client.post("/discussions", json={
+        "topic": "보관 주제", "agents": _manual_agents()}).json()["discussion_id"]
+    r = client.post(f"/discussions/{did}/archive")
+    assert r.status_code == 200
+    saved = tmp_path / f"agora-{did[:8]}.md"
+    assert saved.exists()
+    assert "보관 주제" in saved.read_text(encoding="utf-8")
+    assert r.json()["path"].endswith(".md")
+
+
+def test_archive_unknown_discussion_returns_404(client):
+    assert client.post("/discussions/does-not-exist/archive").status_code == 404
+
+
 def test_set_intercepts(client):
     did = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]

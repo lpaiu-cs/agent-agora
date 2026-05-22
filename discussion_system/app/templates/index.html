@@ -387,18 +387,21 @@ function resetDiscussion() {
   setStatus('대기 중', '');
 }
 
-// 현재 토론의 전체 기록을 마크다운 텍스트 파일로 내려받는다.
-function exportDiscussion() {
+// 현재 토론의 전체 기록을 마크다운 파일로 로컬 discussions/ 폴더에 저장한다.
+async function exportDiscussion() {
   if (!discussionId) {
     alert('저장할 토론이 없습니다. 토론을 먼저 시작하세요.');
     return;
   }
-  const a = document.createElement('a');
-  a.href = '/discussions/' + discussionId + '/export';
-  a.download = 'agora-' + discussionId.slice(0, 8) + '.md';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  try {
+    const r = await fetch('/discussions/' + discussionId + '/archive',
+                          { method: 'POST' });
+    if (!r.ok) throw new Error('저장 실패: ' + r.status);
+    const data = await r.json();
+    alert('토론 기록을 저장했습니다:\n' + data.path);
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 function connectWS(id) {

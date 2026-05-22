@@ -173,6 +173,11 @@ docker compose up --build
 | `POST` | `/discussions/{id}/advance` | 게이트 락 해제 (다음 단계 진입 승인) |
 | `POST` | `/discussions/{id}/interventions` | 유저 개입 주입 |
 | `POST` | `/discussions/{id}/manual-response` | 수동 에이전트 응답 주입 (복붙 터널) |
+| `POST` | `/discussions/{id}/intercept` | 검토 게이트로 가로챌 에이전트 지정 |
+| `POST` | `/discussions/{id}/review/question` | 검토 중인 에이전트에 질문 |
+| `POST` | `/discussions/{id}/review/approve` | 검토 초안 승인 → 최종 포스팅 |
+| `GET`  | `/discussions/{id}/export` | 토론 기록 마크다운 다운로드 |
+| `POST` | `/discussions/{id}/archive` | 토론 기록을 로컬 `discussions/` 폴더에 저장 |
 | `WS`   | `/discussions/{id}/ws` | 진행 상황 실시간 스트림 + 개입 채널 |
 | `GET`  | `/formats` | 등록된 토론 형식 목록 (단계 구성 포함) |
 | `POST` | `/personas/refine` | 페르소나 초안을 주제에 맞춰 LLM 으로 윤문 |

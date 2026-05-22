@@ -22,6 +22,9 @@ env/
 *.sqlite
 *.sqlite3
 
+# 토론 기록 아카이브 (런타임 저장물 — 공유할 파일만 직접 git add)
+discussions/
+
 # OS / 에디터
 .DS_Store
 *.swp

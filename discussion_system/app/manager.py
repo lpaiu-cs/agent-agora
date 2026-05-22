@@ -548,6 +548,21 @@ def render_transcript(state: DiscussionState) -> str:
     return "\n".join(lines) + "\n"
 
 
+def archive_transcript(state: DiscussionState) -> str:
+    """토론 기록을 마크다운 파일로 로컬 폴더에 저장하고 그 경로를 반환한다.
+
+    한 토론당 파일 하나(``agora-{id}.md``)이며, 다시 저장하면 최신 상태로
+    덮어쓴다. 저장 폴더는 ``AGORA_ARCHIVE_DIR`` 환경변수로 바꿀 수 있다
+    (기본 ``discussions``, 서버 작업 디렉터리 기준 상대 경로).
+    """
+    directory = os.getenv("AGORA_ARCHIVE_DIR", "discussions")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"agora-{state.discussion_id[:8]}.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(render_transcript(state))
+    return path
+
+
 # ===========================================================================
 # 무상태 오케스트레이터
 # ===========================================================================

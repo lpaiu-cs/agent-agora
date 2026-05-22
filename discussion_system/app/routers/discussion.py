@@ -24,7 +24,12 @@ from fastapi.responses import PlainTextResponse
 
 from .. import database
 from ..formats import FORMATS
-from ..manager import Orchestrator, PipelineEvent, render_transcript
+from ..manager import (
+    Orchestrator,
+    PipelineEvent,
+    archive_transcript,
+    render_transcript,
+)
 from ..schemas import (
     CreateDiscussionRequest,
     CreateDiscussionResponse,
@@ -142,6 +147,16 @@ async def export_discussion(discussion_id: str) -> PlainTextResponse:
                 f'attachment; filename="agora-{discussion_id[:8]}.md"',
         },
     )
+
+
+@router.post("/{discussion_id}/archive", status_code=200)
+async def archive_discussion(discussion_id: str) -> dict[str, str]:
+    """토론 기록을 마크다운 파일로 로컬 폴더(discussions/)에 저장한다.
+
+    한 토론당 파일 하나이며, 다시 호출하면 최신 상태로 덮어쓴다.
+    """
+    state = await _load_or_404(discussion_id)
+    return {"status": "archived", "path": archive_transcript(state)}
 
 
 @router.post("/{discussion_id}/advance", status_code=202)
