@@ -8,6 +8,9 @@
 <!-- 마크다운 렌더링: marked 로 파싱, DOMPurify 로 XSS 차단 후 출력 -->
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<!-- 수식 렌더링: 마크다운 안의 $..$ · $$..$$ · 단독 '['/']' 줄을 KaTeX 로 -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <style>
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
   .msg-body.streaming::after {
@@ -129,21 +132,21 @@
       </button>
     </aside>
 
-    <!-- ===== 토론 주제 + 타임라인 + 개입 존 ===== -->
+    <!-- ===== 타임라인 (토론 주제 + 포스팅 + 개입 존) ===== -->
     <section class="flex-1 flex flex-col min-h-0">
-      <!-- 토론 주제 — 포스팅 영역 상단에 고정. 긴 주제문도 넓게 보고 편집한다. -->
-      <div class="border-b border-slate-200 bg-white px-5 py-3 shrink-0">
-        <label class="block text-xs font-semibold text-slate-500 mb-1">📌 토론 주제</label>
-        <textarea id="topicInput" rows="2"
-                  placeholder="토론 주제를 입력하세요 — 여러 줄, 긴 주제문도 괜찮습니다"
-                  class="w-full px-3 py-2 text-sm border border-slate-300 rounded
-                         resize-y leading-relaxed overflow-y-auto
-                         read-only:bg-slate-100 read-only:text-slate-600"
-                  style="max-height:40vh;">신규 사용자의 첫 일주일 경험을 어떻게 개선할까?</textarea>
-      </div>
       <div id="timeline" class="timeline flex-1 overflow-y-auto p-5">
-        <div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">
-          상단에 주제를 적고 좌측에서 에이전트를 설정한 뒤 <b>[▶ 토론 시작]</b>을 누르세요.
+        <!-- 토론 주제 — 타임라인의 첫 카드. 다른 포스팅들과 함께 스크롤된다. -->
+        <div id="topicCard" class="bg-white border border-slate-200 rounded-lg p-3 mb-4">
+          <label class="block text-xs font-semibold text-slate-500 mb-1">📌 토론 주제</label>
+          <textarea id="topicInput" rows="2"
+                    placeholder="토론 주제를 입력하세요 — 여러 줄, 긴 주제문도 괜찮습니다"
+                    class="w-full px-3 py-2 text-sm border border-slate-300 rounded
+                           resize-y leading-relaxed
+                           read-only:bg-slate-100 read-only:text-slate-600"
+                    >신규 사용자의 첫 일주일 경험을 어떻게 개선할까?</textarea>
+        </div>
+        <div id="placeholder" class="text-center text-slate-400 mt-16 text-sm">
+          위에 주제를 적고 좌측에서 에이전트를 설정한 뒤 <b>[▶ 토론 시작]</b>을 누르세요.
         </div>
       </div>
 
@@ -225,6 +228,36 @@ function escapeHtml(s) {
   d.textContent = (s == null) ? '' : String(s);
   return d.innerHTML;
 }
+// LLM 응답에서 자주 보이는 비표준 마크다운 패턴을 표준 markdown 으로 정규화한다.
+// (1) 단독 '#####' (5+ 해시) 줄은 가로 구분선으로, (2) 단독 '[' / ']' 줄은 LaTeX
+// 디스플레이 수식 구분자($$)로 치환한다.
+function preprocessMarkdown(src) {
+  src = src.replace(/^\s*#{5,}\s*$/gm, '---');
+  // 함수 형태로 치환 — String.replace 의 '$$' 는 리터럴 '$' 로 해석되므로
+  // 문자열 치환을 쓰면 안 된다.
+  src = src.replace(/^\s*\[\s*$/gm, () => '$$').replace(/^\s*\]\s*$/gm, () => '$$');
+  return src;
+}
+
+// LaTeX 수식($$..$$ 디스플레이, $..$ 인라인)을 미리 KaTeX HTML 로 렌더한다 —
+// marked 의 줄바꿈 처리(<br>)가 수식 안에 끼어들기 전에 통째로 치환해야 수식이
+// 깨지지 않는다. 렌더 실패 시(KaTeX 미로드·문법 오류)는 원문을 그대로 둔다.
+function prerenderMath(src) {
+  if (typeof katex === 'undefined') return src;
+  const safe = (tex, displayMode) => {
+    try {
+      return katex.renderToString(tex.trim(), {
+        displayMode, throwOnError: false, output: 'html',
+      });
+    } catch (e) { return null; }
+  };
+  // 디스플레이($$..$$) 먼저 — 인라인 매치가 디스플레이 경계를 잠식하지 않게.
+  src = src.replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => safe(tex, true) || m);
+  // 인라인($..$) — 한 줄, 그 사이에 '$' 가 들어가지 않은 경우만.
+  src = src.replace(/\$([^\$\n]+?)\$/g, (m, tex) => safe(tex, false) || m);
+  return src;
+}
+
 // 마크다운 포스팅을 안전한 HTML 로 렌더링한다. marked 로 파싱하고 DOMPurify 로
 // XSS 를 차단하므로 LLM·복붙 응답을 innerHTML 로 넣어도 안전하다. 라이브러리가
 // 로드되지 않았으면(오프라인 등) 평문 이스케이프로 폴백한다.
@@ -233,9 +266,16 @@ function renderMarkdown(text) {
   if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
     return escapeHtml(src);
   }
-  return DOMPurify.sanitize(marked.parse(src));
+  const normalized = prerenderMath(preprocessMarkdown(src));
+  return DOMPurify.sanitize(marked.parse(normalized));
 }
 function scrollTimeline() { timelineEl.scrollTop = timelineEl.scrollHeight; }
+// 타임라인을 비우되 주제 카드(#topicCard)는 보존한다 — 시작·스냅샷·초기화 공통.
+function clearTimeline() {
+  Array.from(timelineEl.children).forEach((child) => {
+    if (child.id !== 'topicCard') child.remove();
+  });
+}
 // 단계 인스턴스 키('probe#3')를 사람이 읽는 라벨로 — 반복 단계는 라운드를 덧붙인다.
 function phaseLabel(phaseId) {
   const parts = String(phaseId || '').split('#');
@@ -419,7 +459,7 @@ async function startDiscussion() {
         body: JSON.stringify({ agent_ids: intercepts }),
       });
     }
-    timelineEl.innerHTML = '';
+    clearTimeline();
     bubbles = {};
     wsReconnectAttempts = 0;
     if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
@@ -443,10 +483,14 @@ function resetDiscussion() {
   usageTotal = 0;
   lastConvergence = null;
   updateUsagePill();
-  timelineEl.innerHTML =
-    '<div id="placeholder" class="text-center text-slate-400 mt-24 text-sm">'
-    + '상단에 주제를 적고 좌측에서 에이전트를 설정한 뒤 '
-    + '<b>[▶ 토론 시작]</b>을 누르세요.</div>';
+  clearTimeline();
+  const placeholder = document.createElement('div');
+  placeholder.id = 'placeholder';
+  placeholder.className = 'text-center text-slate-400 mt-16 text-sm';
+  placeholder.innerHTML =
+    '위에 주제를 적고 좌측에서 에이전트를 설정한 뒤 '
+    + '<b>[▶ 토론 시작]</b>을 누르세요.';
+  timelineEl.appendChild(placeholder);
   hideInterventionBar();
   $('interventionInput').value = '';
   $('topicInput').readOnly = false;   // 다시 편집 가능 상태로
@@ -956,7 +1000,7 @@ function renderSnapshot(state) {
   // 단, 비우기 전에 작성 중이던 텍스트를 대피시켜 두고(captureDrafts), 재구성이
   // 끝난 직후 복원한다(restoreDrafts) — 일시적 단절에도 입력 글자를 잃지 않도록.
   const drafts = captureDrafts();
-  timelineEl.innerHTML = '';
+  clearTimeline();
   bubbles = {};
   hideInterventionBar();
   agentsById = {};
