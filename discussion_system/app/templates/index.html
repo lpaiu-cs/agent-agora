@@ -77,6 +77,11 @@
       대기 중
     </span>
     <span id="usagePill" class="text-xs text-slate-400"></span>
+    <button id="loadBtn"
+            class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
+                   text-slate-200">📂 불러오기</button>
+    <input id="loadFileInput" type="file"
+           accept=".md,.markdown,text/markdown,text/plain" class="hidden" />
     <button id="exportBtn"
             class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
                    text-slate-200">📄 텍스트 저장</button>
@@ -494,8 +499,44 @@ function resetDiscussion() {
   hideInterventionBar();
   $('interventionInput').value = '';
   $('topicInput').readOnly = false;   // 다시 편집 가능 상태로
+  $('topicCard').classList.remove('hidden');   // 불러오기 모드에서 가려져 있었다면
   $('startBtn').disabled = false;
   setStatus('대기 중', '');
+}
+
+// ---- 저장된 토론(.md) 불러오기 — 읽기 전용 뷰 -------------------------------
+// 다운로드한 export 파일이든 로컬 discussions/ 의 archive 파일이든, 사용자가
+// 파일 피커로 고른 마크다운을 통째 렌더해 보여준다. 이어가기는 지원하지 않는다.
+function openLoadFile() { $('loadFileInput').click(); }
+
+async function onLoadFileChange(event) {
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';   // 같은 파일을 다시 선택할 수 있도록 초기화
+  if (!file) return;
+  try {
+    const text = await file.text();
+    enterViewMode(text, file.name);
+  } catch (e) {
+    alert('파일 읽기 실패: ' + e.message);
+  }
+}
+
+function enterViewMode(markdown, filename) {
+  // 진행 중 세션·소켓이 있으면 모두 정리하고 깨끗한 상태로 진입한다.
+  resetDiscussion();
+  // 불러온 파일은 자체 헤더(주제·에이전트 목록 등)를 가지므로 주제 카드는 가린다.
+  $('topicCard').classList.add('hidden');
+  // 시작 버튼은 비활성화 — 불러온 토론은 이어갈 수 없다.
+  $('startBtn').disabled = true;
+  // placeholder 가 있으면 제거하고, 통째 렌더한 카드 하나로 채운다.
+  clearTimeline();
+  const ph = $('placeholder'); if (ph) ph.remove();
+  const card = document.createElement('article');
+  card.id = 'loadedCard';
+  card.className = 'md bg-white border border-slate-200 rounded-lg p-5';
+  card.innerHTML = renderMarkdown(markdown);
+  timelineEl.appendChild(card);
+  setStatus('📂 ' + filename + ' (읽기 전용)', '');
 }
 
 // 현재 토론의 전체 기록을 마크다운 파일로 로컬 discussions/ 폴더에 저장한다.
@@ -1218,6 +1259,8 @@ $('postBtn').addEventListener('click', postIntervention);
 $('skipBtn').addEventListener('click', skipPhase);
 $('endBtn').addEventListener('click', endDiscussion);
 $('exportBtn').addEventListener('click', exportDiscussion);
+$('loadBtn').addEventListener('click', openLoadFile);
+$('loadFileInput').addEventListener('change', onLoadFileChange);
 $('topicInput').addEventListener('input', autoGrowTopic);
 $('formatSelect').addEventListener('change', onFormatChange);
 autoGrowTopic();   // 기본 주제 텍스트에 맞춰 초기 높이 조정
