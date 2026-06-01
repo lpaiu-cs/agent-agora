@@ -14,7 +14,7 @@
 - **다중 토론 형식** — 구조화 토론(5단계)·브레인스토밍(4단계)·소크라테스식 문답(가변 길이). 형식마다 단계 구성·프롬프트가 다르며 코드로 추가 가능
 - **가변 길이 형식** — 반복(`repeatable`) 단계가 합의 근접도에 따라 라운드를 거듭한다 (소크라테스식 문답의 문답 라운드)
 - **사회자(facilitator) 에이전트** — 선택적 사회자가 단계 경계에서 개회·중간 조율·폐회로 진행을 조율하고, 가변 길이 형식에서는 반복 라운드 지속 여부까지 판단 (토론자가 아닌 부가 레이어)
-- **멀티 공급자 LLM** — OpenAI · Anthropic · Ollama, 그리고 복붙 기반 `manual` 공급자
+- **멀티 공급자 LLM** — OpenAI · Anthropic · DeepSeek · Ollama, 그리고 복붙 기반 `manual` 공급자
 - **토큰 단위 실시간 스트리밍** — WebSocket 으로 발언이 생성되는 과정을 그대로 전송
 - **이벤트 구동형 무상태 오케스트레이션** — 매 이벤트가 `DB 로드 → 전이 → 저장 → 종료`,
   단계 사이·입력 대기 중 메모리 점유 0
@@ -140,19 +140,21 @@ pip install -r requirements.txt
 
 ### 2) 환경 변수 설정
 
-실제 등록한 에이전트가 쓰는 공급자의 키만 있으면 된다. (모두 선택 사항 —
-`manual` 공급자만 쓰면 키 없이도 동작한다.)
+저장소 루트의 `.env.example` 을 `.env` 로 복사하고 필요한 키만 채우면 된다 —
+앱은 기동 시 `.env` 를 자동 로드한다(`python-dotenv`). 환경 변수로 직접
+export 해도 동일하게 동작한다. 모두 선택 사항이며, `manual` 공급자만 쓰면
+키 없이도 토론이 굴러간다.
 
 ```bash
-export OPENAI_API_KEY="sk-..."                 # OpenAI(gpt-*) 에이전트 사용 시
-export ANTHROPIC_API_KEY="sk-ant-..."          # Anthropic(claude-*) 에이전트 사용 시
-export OLLAMA_HOST="http://localhost:11434"    # (선택) Ollama 호스트
+cp .env.example .env
+# 그 다음 .env 를 편집해 필요한 키를 채운다.
 ```
 
 | 변수 | 용도 |
 |------|------|
-| `OPENAI_API_KEY` | OpenAI 공급자 사용 시 필수 |
-| `ANTHROPIC_API_KEY` | Anthropic 공급자 사용 시 필수 |
+| `OPENAI_API_KEY` | OpenAI(gpt-*) 공급자 사용 시 필수 |
+| `ANTHROPIC_API_KEY` | Anthropic(claude-*) 공급자 사용 시 필수 |
+| `DEEPSEEK_API_KEY` | DeepSeek(deepseek-*) 공급자 사용 시 필수 — `api.deepseek.com` 의 OpenAI-호환 엔드포인트 사용 |
 | `OLLAMA_HOST` | (선택) Ollama 호스트 주소. 기본 `http://localhost:11434` |
 | `DATABASE_URL` | (선택) 비동기 DB URL. 기본 `sqlite+aiosqlite:///./agora.db`. `postgresql+asyncpg://…` 도 그대로 수용 (`AGORA_DB_URL` 은 하위 호환 폴백) |
 | `AGORA_MAX_CONCURRENT_LLM` | (선택) 동시 LLM 호출 상한. 기본 `8`. 미설정·형식 오류·0 이하 값은 기본값으로 흡수 |

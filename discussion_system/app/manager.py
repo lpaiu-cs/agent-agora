@@ -206,6 +206,17 @@ def _build_client(provider: ModelProvider) -> object:
         if not api_key:
             raise DiscussionError("환경 변수 ANTHROPIC_API_KEY 가 설정되지 않았습니다.")
         return AsyncAnthropic(api_key=api_key)
+    if provider is ModelProvider.DEEPSEEK:
+        # DeepSeek 은 OpenAI-호환 API — openai SDK 의 AsyncOpenAI 를 base_url 만
+        # 바꿔 재사용한다.
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise DiscussionError("openai 패키지가 설치되지 않았습니다.") from exc
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise DiscussionError("환경 변수 DEEPSEEK_API_KEY 가 설정되지 않았습니다.")
+        return AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     if provider is ModelProvider.OLLAMA:
         try:
             from ollama import AsyncClient
@@ -1460,7 +1471,8 @@ class Orchestrator:
         provider = agent.get_provider()
         client = self._pool.get(provider)
         async with self._llm_semaphore:
-            if provider is ModelProvider.OPENAI:
+            if provider is ModelProvider.OPENAI or provider is ModelProvider.DEEPSEEK:
+                # DeepSeek 은 OpenAI 호환 — 같은 스트리밍 경로(_call_openai) 재사용.
                 result = await _call_openai(
                     client, agent.model, system, user,
                     agent.temperature, agent.max_tokens, on_token)

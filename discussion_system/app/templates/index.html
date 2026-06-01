@@ -144,11 +144,12 @@
         <div id="topicCard" class="bg-white border border-slate-200 rounded-lg p-3 mb-4">
           <label class="block text-xs font-semibold text-slate-500 mb-1">📌 토론 주제</label>
           <textarea id="topicInput" rows="2"
-                    placeholder="토론 주제를 입력하세요 — 여러 줄, 긴 주제문도 괜찮습니다"
+                    placeholder="토론 주제를 입력하세요 — 여러 줄·마크다운·LaTeX 수식 OK"
                     class="w-full px-3 py-2 text-sm border border-slate-300 rounded
-                           resize-y leading-relaxed
-                           read-only:bg-slate-100 read-only:text-slate-600"
+                           resize-y leading-relaxed"
                     >신규 사용자의 첫 일주일 경험을 어떻게 개선할까?</textarea>
+          <!-- 토론 시작 후 잠긴 주제 — textarea 대신 마크다운으로 렌더링한다. -->
+          <div id="topicRender" class="md hidden text-sm text-slate-800 leading-relaxed"></div>
         </div>
         <div id="placeholder" class="text-center text-slate-400 mt-16 text-sm">
           위에 주제를 적고 좌측에서 에이전트를 설정한 뒤 <b>[▶ 토론 시작]</b>을 누르세요.
@@ -199,7 +200,8 @@ const PERSONA_LABEL = {
   mediator: '중재자', analyst: '분석가',
 };
 const PROVIDERS = [['openai', 'OpenAI'], ['anthropic', 'Anthropic'],
-                   ['ollama', 'Ollama'], ['manual', 'Manual Tunnel']];
+                   ['deepseek', 'DeepSeek'], ['ollama', 'Ollama'],
+                   ['manual', 'Manual Tunnel']];
 const PTYPES = [['ideator', '아이디어 발상가'], ['builder', '아이디어 확장가'],
                 ['critic', '비판적 검토자'], ['synthesizer', '통합·정리자'],
                 ['pragmatist', '실용성 검토자'], ['neutral', '자유 참여자']];
@@ -456,7 +458,7 @@ async function startDiscussion() {
     });
     if (!res.ok) throw new Error('토론 생성 실패: ' + res.status + ' ' + (await res.text()));
     discussionId = (await res.json()).discussion_id;
-    $('topicInput').readOnly = true;   // 토론 시작 후 주제는 고정 — 읽기 전용
+    setTopicReadOnly(true);            // 토론 시작 후 주제는 고정 — 마크다운 렌더 뷰로
     const intercepts = currentIntercepts();
     if (intercepts.length) {
       await fetch(`/discussions/${discussionId}/intercept`, {
@@ -498,7 +500,7 @@ function resetDiscussion() {
   timelineEl.appendChild(placeholder);
   hideInterventionBar();
   $('interventionInput').value = '';
-  $('topicInput').readOnly = false;   // 다시 편집 가능 상태로
+  setTopicReadOnly(false);            // 다시 편집 가능 상태로 (textarea 노출)
   $('topicCard').classList.remove('hidden');   // 불러오기 모드에서 가려져 있었다면
   $('startBtn').disabled = false;
   setStatus('대기 중', '');
@@ -1047,7 +1049,7 @@ function renderSnapshot(state) {
   agentsById = {};
   (state.agents || []).forEach((a) => { agentsById[a.agent_id] = a; });
   if (state.topic) $('topicInput').value = state.topic;
-  $('topicInput').readOnly = true;   // 스냅샷이 있다 = 진행 중인 토론 — 주제 고정
+  setTopicReadOnly(true);            // 스냅샷이 있다 = 진행 중인 토론 — 주제 고정
   autoGrowTopic();
   currentFormatId = state.format_id || 'debate';   // 단계 렌더링의 기준 형식
 
@@ -1209,6 +1211,23 @@ function autoGrowTopic() {
   const el = $('topicInput');
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, window.innerHeight * 0.4) + 'px';
+}
+// 주제 영역 잠금·해제 — 편집 모드는 textarea, 잠긴 상태는 마크다운 렌더 뷰로
+// 토글한다. 마크다운/LaTeX 가 다른 영역과 동일하게 적용된다.
+function setTopicReadOnly(readOnly) {
+  const ta = $('topicInput');
+  const view = $('topicRender');
+  ta.readOnly = readOnly;
+  if (readOnly) {
+    view.innerHTML = renderMarkdown(ta.value || '');
+    view.classList.remove('hidden');
+    ta.classList.add('hidden');
+  } else {
+    view.classList.add('hidden');
+    view.innerHTML = '';
+    ta.classList.remove('hidden');
+    autoGrowTopic();
+  }
 }
 
 // 토론 형식 목록(GET /formats)을 받아 선택 드롭다운을 채운다.

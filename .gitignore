@@ -16,6 +16,7 @@ env/
 # 환경 변수 / 시크릿
 .env
 .env.*
+!.env.example
 
 # SQLite 데이터베이스 (런타임 생성물)
 *.db

@@ -19,6 +19,8 @@ def _two_agents():
     ("o3-mini", ModelProvider.OPENAI),
     ("chatgpt-4o-latest", ModelProvider.OPENAI),
     ("claude-opus-4-7", ModelProvider.ANTHROPIC),
+    ("deepseek-chat", ModelProvider.DEEPSEEK),
+    ("deepseek-reasoner", ModelProvider.DEEPSEEK),
     ("llama3.1", ModelProvider.OLLAMA),
     ("mistral-large", ModelProvider.OLLAMA),
     ("qwen2.5", ModelProvider.OLLAMA),
