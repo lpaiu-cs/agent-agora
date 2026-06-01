@@ -6,9 +6,15 @@ from app.manager import (
     _convergence_from_summary,
     _llm_agent,
     _positive_int_env,
+    _render_convergence_trajectory,
     _split_reasoning_draft,
 )
-from app.schemas import AgentConfig, DiscussionState, ModelProvider
+from app.schemas import (
+    AgentConfig,
+    DiscussionState,
+    ModelProvider,
+    PhaseSummary,
+)
 
 
 def _agent(agent_id, provider):
@@ -79,6 +85,23 @@ def test_convergence_falls_back_to_holistic_when_no_points():
     # 둘 다 없으면 0.0, 범위 밖 값은 클램프.
     assert _convergence_from_summary({}) == 0.0
     assert _convergence_from_summary({"convergence_score": 1.7}) == 1.0
+
+
+def test_render_convergence_trajectory():
+    # 요약된 단계가 없으면 빈 문자열.
+    state = _state(ModelProvider.OPENAI, ModelProvider.OPENAI)  # debate 기본
+    assert _render_convergence_trajectory(state) == ""
+    # 직전 두 단계 요약이 있으면 추이가 단계 순서대로(라벨·%) 렌더된다.
+    state.phase_records = {"opinion": [], "critique": []}
+    state.phase_summaries = [
+        PhaseSummary(phase="opinion", convergence_score=0.45),
+        PhaseSummary(phase="critique", convergence_score=0.6),
+    ]
+    out = _render_convergence_trajectory(state)
+    assert "합의 근접도 추이" in out
+    assert "45%" in out and "60%" in out
+    # opinion(45%)이 critique(60%)보다 먼저 나온다 — 실행 순서.
+    assert out.index("45%") < out.index("60%")
 
 
 def test_split_reasoning_draft():

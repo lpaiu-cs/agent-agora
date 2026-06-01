@@ -171,6 +171,29 @@ def _latest_convergence(state: DiscussionState, instance_key: str) -> float:
     return 0.0
 
 
+def _render_convergence_trajectory(
+    state: DiscussionState, max_items: int = 3
+) -> str:
+    """직전까지 단계들의 합의 근접도 추이를 텍스트로 렌더한다.
+
+    요약 프롬프트에 주입해 '이번 단계는 이 추이의 연장선' 임을 모델이 보게 한다 —
+    단계가 진행될수록 자연스럽게 수렴하도록(과소평가 방지). 아직 요약된 단계가
+    없으면 빈 문자열. 최근 ``max_items`` 개만 넣어 프롬프트 길이를 묶는다.
+    """
+    fmt = _format_of(state)
+    summary_of = {s.phase: s for s in state.phase_summaries}
+    lines: list[str] = []
+    for spec, rnd, key in _instances_in_order(fmt, state):
+        s = summary_of.get(key)
+        if s is None:
+            continue
+        label = _instance_label(spec, rnd)
+        lines.append(f"- {label}: 합의 근접도 {s.convergence_score:.0%}")
+    if not lines:
+        return ""
+    return "[직전까지의 합의 근접도 추이]\n" + "\n".join(lines[-max_items:])
+
+
 def _stored_decision(state: DiscussionState, instance_key: str) -> Optional[str]:
     """주어진 단계 인스턴스에 대해 사회자가 내린 진행 결정 (있으면 그 값).
 
@@ -1692,9 +1715,13 @@ class Orchestrator:
         # 합의 근접도를 '느낌 숫자' 로 바로 받지 않는다 — 먼저 쟁점을 항목별로 분해해
         # 합의/부분합의/대립으로 분류시키고(issue_points), 그 분포에서 점수를 계산한다.
         # 채점 앵커를 명시해 '입장/프레임 일치' 가 0 점으로 과소평가되는 것을 막는다.
+        # 또한 직전 단계들의 추이를 함께 줘, 이번 단계가 그 연장선임을 보게 한다.
+        trajectory = _render_convergence_trajectory(state)
+        traj_block = f"{trajectory}\n\n" if trajectory else ""
         user = (
             f"다음은 '{label}' 단계의 발언이다.\n"
             f"{transcript}\n\n"
+            f"{traj_block}"
             "[작업]\n"
             "1) 이 단계에서 다뤄진 '쟁점 항목'을 모두 나열하고, 각각을 다음 중 "
             "하나로 분류하라:\n"
@@ -1707,7 +1734,9 @@ class Orchestrator:
             "   - 0.5 핵심 쟁점 절반쯤 합의 / 0.75 대부분 합의, 세부만 이견\n"
             "   - 1.0 모든 핵심 쟁점 합의(표현 차이만 남음)\n"
             "   ※ 참가자들이 같은 프레임·입장을 채택했다면 세부 구현 이견이 남아도 "
-            "그 자체로 0.6 이상이다. 토론은 단계가 진행될수록 수렴함을 반영하라.\n\n"
+            "그 자체로 0.6 이상이다. 토론은 단계가 진행될수록 수렴하는 경향이 "
+            "있으니, 위 추이가 있다면 새 합의가 생겼을 때 직전보다 낮게 매기지 "
+            "말라(새 이견이 불거진 경우는 예외).\n\n"
             "아래 JSON 스키마로만 응답하라:\n"
             '{"agent_summaries": [{"agent_id": "...", "initial_claim": "...", '
             '"current_stance": "...", "stance_shift": "..."}], '
