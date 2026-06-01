@@ -4,11 +4,12 @@
 지정하지 않으면 동작은 완전히 종전과 같다. 호출 실패도 토론을 막지 않는다.
 가변 길이 형식에서는 사회자의 'decision' 훅이 문답 라운드 루프를 구동한다.
 """
+import asyncio
 import json
 
 from app import database
 from app.manager import PipelineEvent, render_transcript
-from app.schemas import DiscussionStatus, FacilitatorNote
+from app.schemas import DiscussionStatus, FacilitatorNote, UserIntervention
 
 
 async def _drive_to_completion(orchestrator, did, limit=16):
@@ -101,6 +102,74 @@ def test_render_transcript_includes_facilitator_notes(make_state, make_agent):
     assert "사회자: **진행자**" in doc        # 헤더에 사회자 표기
     assert "사회자 — 개회" in doc and "개회사 본문" in doc
     assert "사회자 — 폐회" in doc and "폐회사 본문" in doc
+
+
+async def test_h_intervention_regenerates_between_note(
+    orchestrator, make_state, make_agent, patch_llm,
+):
+    """H 개입 직후 사회자가 새 between 노트를 작성한다 — 기존 노트는 교체된다."""
+    counter = {"n": 0}
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        if "사회자 작업" in user:
+            counter["n"] += 1
+            return f"사회자 코멘트 #{counter['n']}"
+        if "convergence_score" in user:
+            return json.dumps({"agent_summaries": [], "key_conflicts": [],
+                               "convergence_score": 0.5})
+        return "에이전트 발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(
+        discussion_id="bri", facilitator=make_agent("f1", "사회자")))
+
+    await orchestrator.process_event("bri", PipelineEvent.START)
+    st = await database.load_state("bri")
+    # debate 의 첫 게이트 — opinion 끝, between 노트가 떠 있다.
+    assert st.status is DiscussionStatus.WAITING_FOR_USER
+    between_initial = [n for n in st.facilitator_notes
+                       if n.kind == "between" and n.phase == "opinion"]
+    assert len(between_initial) == 1
+    initial_content = between_initial[0].content
+
+    # H 개입 — 백그라운드 between 재작성 발사.
+    await orchestrator.add_intervention("bri", UserIntervention(
+        message="이 지점을 다시 짚어 주세요", after_phase="opinion"))
+    inflight = list(orchestrator._inflight)
+    if inflight:
+        await asyncio.gather(*inflight)
+
+    st = await database.load_state("bri")
+    between_final = [n for n in st.facilitator_notes
+                     if n.kind == "between" and n.phase == "opinion"]
+    assert len(between_final) == 1                # 여전히 1건 — 교체된 것
+    assert between_final[0].content != initial_content   # 새 내용으로 재작성
+
+
+async def test_h_intervention_no_facilitator_skips_regen(
+    orchestrator, make_state, patch_llm,
+):
+    """사회자 미지정 — H 개입은 between 재작성 흐름을 건너뛴다 (종전 동작 보존)."""
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        if "convergence_score" in user:
+            return json.dumps({"agent_summaries": [], "key_conflicts": [],
+                               "convergence_score": 0.5})
+        return "발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(discussion_id="nri"))
+
+    await orchestrator.process_event("nri", PipelineEvent.START)
+    await orchestrator.add_intervention("nri", UserIntervention(
+        message="개입", after_phase="opinion"))
+    # 백그라운드 태스크가 발사됐다면 끝나길 기다린다 — 사회자 없으므로 발사 안 됨.
+    inflight = list(orchestrator._inflight)
+    if inflight:
+        await asyncio.gather(*inflight)
+
+    st = await database.load_state("nri")
+    assert st.facilitator_notes == []         # 사회자 없으니 노트 자체가 없다
+    assert len(st.user_interventions) == 1    # 개입은 정상 기록
 
 
 # ---------------------------------------------------------------------------

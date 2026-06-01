@@ -871,6 +871,11 @@ class Orchestrator:
 
         다음 단계 프롬프트 맥락에 '참가자 H' 로 반영된다. 낙관적 락 재시도 시
         중복 적재를 막기 위해 (created_at, message) 로 멱등성을 보장한다.
+
+        사회자가 있고 현재가 비반복 단계 게이트면(=between 노트가 떠 있는 상태),
+        개입 직후 between 을 다시 쓰도록 백그라운드 태스크를 발사한다 — 라우터
+        응답을 LLM 호출 시간만큼 늦추지 않으면서 사회자가 H 의 발언을 반영한
+        새 중간 조율을 만들도록 한다.
         """
         def mutate(s: DiscussionState) -> None:
             already = any(
@@ -887,6 +892,39 @@ class Orchestrator:
             discussion_id, WSMessageType.USER_INTERVENTION,
             {"intervention": intervention.model_dump(mode="json")},
         )
+
+        # 사회자 있고 비반복 단계 게이트면 between 재작성 — 백그라운드 발사.
+        state = await self._load(discussion_id)
+        if state is None or state.facilitator is None:
+            return
+        if state.status is not DiscussionStatus.WAITING_FOR_USER:
+            return
+        spec = _format_of(state).phase(state.current_phase)
+        if spec is None or spec.repeatable:
+            return
+        task = asyncio.create_task(
+            self._regenerate_facilitator_between(
+                discussion_id, state.current_phase))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
+    async def _regenerate_facilitator_between(
+        self, discussion_id: str, phase: str
+    ) -> None:
+        """H 개입 직후 호출 — 기존 between 노트를 지우고 사회자가 다시 쓰게 한다.
+
+        브로드캐스트되는 새 facilitator_note 를 받은 UI 가 기존 같은 (kind, phase)
+        노트를 교체한다(렌더링 측 dedup).
+        """
+        def remove(s: DiscussionState) -> None:
+            s.facilitator_notes[:] = [
+                n for n in s.facilitator_notes
+                if not (n.kind == "between" and n.phase == phase)
+            ]
+            s.touch()
+
+        await self._commit(discussion_id, remove)
+        await self._run_facilitator(discussion_id, "between", phase)
 
     async def set_intercepts(
         self, discussion_id: str, agent_ids: list[str]
