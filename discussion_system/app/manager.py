@@ -360,6 +360,46 @@ async def _call_ollama(
     return "".join(parts).strip(), usage
 
 
+#: 쟁점 항목 분류 → 합의 기여 가중치. 대립=0, 부분합의=0.5, 합의=1.
+_ISSUE_STATUS_WEIGHT = {"agreed": 1.0, "partial": 0.5, "contested": 0.0}
+
+
+def _convergence_from_summary(data: dict) -> float:
+    """요약 JSON 에서 합의 근접도를 산출한다 (0.0~1.0).
+
+    가능하면 ``issue_points`` 분류 분포에서 *계산*한다 — 모델이 근거 없이 뱉는
+    holistic 숫자보다, 셀 수 있는 쟁점별 합의/대립 분류에서 점수를 끌어내는 편이
+    과소평가에 덜 취약하다. issue_points 가 없으면 모델의 convergence_score 로,
+    둘 다 있으면 두 값을 평균해 한쪽 극단을 누그러뜨린다.
+    """
+    points = data.get("issue_points")
+    derived: Optional[float] = None
+    if isinstance(points, list) and points:
+        weights = [
+            _ISSUE_STATUS_WEIGHT.get(str(p.get("status", "")).lower())
+            for p in points if isinstance(p, dict)
+        ]
+        weights = [w for w in weights if w is not None]
+        if weights:
+            derived = sum(weights) / len(weights)
+
+    raw_score: Optional[float]
+    try:
+        raw_score = float(data.get("convergence_score"))
+    except (TypeError, ValueError):
+        raw_score = None
+
+    if derived is not None and raw_score is not None:
+        score = (derived + raw_score) / 2.0   # 분해 점수와 직출 점수의 평균
+    elif derived is not None:
+        score = derived
+    elif raw_score is not None:
+        score = raw_score
+    else:
+        score = 0.0
+    return max(0.0, min(1.0, score))
+
+
 def _extract_json(raw: str) -> dict:
     """LLM 응답 텍스트에서 JSON 객체를 최대한 관대하게 파싱한다."""
     try:
@@ -1412,9 +1452,10 @@ class Orchestrator:
     ) -> Optional[str]:
         """사회자 훅 — 단계 경계에서 진행 노트를 생성·기록·브로드캐스트한다.
 
-        사회자가 지정돼 있지 않거나 LLM 호출이 실패하면 조용히 건너뛴다 — 사회자는
-        토론 진행을 막지 않는 부가 레이어다. ``kind="decision"`` 이면 진행 결정
-        ("continue"/"next"/"conclude")을 반환한다(그 외에는 None).
+        사회자는 토론 진행을 막지 않는 부가 레이어다. LLM 호출이 실패하거나 빈
+        응답이면 — 개회·중간·폐회는 *보이는 경고 노트*로 남겨(침묵 금지) 사용자가
+        원인을 알 수 있게 하고, 진행 결정(``kind="decision"``)은 노트 없이 None 을
+        반환해 합의 근접도 숫자 폴백에 맡긴다.
         """
         state = await self._load(discussion_id)
         if state is None or state.facilitator is None:
@@ -1424,17 +1465,30 @@ class Orchestrator:
             if note.kind == kind and note.phase == phase:
                 return note.decision
         system, user = _build_facilitator_prompt(state, kind, phase)
+        decision: Optional[str] = None
+        failed = False
         try:
             text, usage = await self._invoke_agent_usage(
                 state.facilitator, system, user)
+            content = text.strip()
+            if not content:
+                raise DiscussionError("사회자 응답이 비어 있습니다.")
         except Exception as exc:  # noqa: BLE001 - 사회자 실패는 비치명적
             logger.warning("사회자 호출 실패(%s/%s): %r", kind, phase, exc)
-            return None
-        decision = (
-            _parse_facilitator_decision(text) if kind == "decision" else None)
+            if kind == "decision":
+                return None   # 진행 결정 실패 → plan_next 가 숫자 근접도로 폴백
+            content = f"[시스템 경고: 사회자 응답 생성 실패 - {exc}]"
+            usage, failed = {}, True
+        else:
+            decision = (
+                _parse_facilitator_decision(content) if kind == "decision"
+                else None)
+        meta: dict = {"usage": usage}
+        if failed:
+            meta["failed"] = True
         note = FacilitatorNote(
-            phase=phase, kind=kind, content=text.strip() or "(빈 응답)",
-            decision=decision, metadata={"usage": usage})
+            phase=phase, kind=kind, content=content, decision=decision,
+            metadata=meta)
         await self._commit(
             discussion_id, lambda s: _append_facilitator_note(s, note))
         await self._emit(
@@ -1631,17 +1685,36 @@ class Orchestrator:
         spec = _format_of(state).phase(phase)
         label = spec.label if spec else phase
         system = (
-            "너는 토론 분석가다. 요청한 JSON 객체만 출력하고 다른 설명은 하지 않는다."
+            "너는 중립적 토론 분석가다. 발언에서 합의점과 이견을 한쪽으로 치우치지 "
+            "않고 균형 있게 식별한다. 요청한 JSON 객체만 출력하고 다른 설명은 하지 "
+            "않는다."
         )
+        # 합의 근접도를 '느낌 숫자' 로 바로 받지 않는다 — 먼저 쟁점을 항목별로 분해해
+        # 합의/부분합의/대립으로 분류시키고(issue_points), 그 분포에서 점수를 계산한다.
+        # 채점 앵커를 명시해 '입장/프레임 일치' 가 0 점으로 과소평가되는 것을 막는다.
         user = (
             f"다음은 '{label}' 단계의 발언이다.\n"
             f"{transcript}\n\n"
-            "아래 JSON 스키마에 맞춰 정확히 응답하라:\n"
+            "[작업]\n"
+            "1) 이 단계에서 다뤄진 '쟁점 항목'을 모두 나열하고, 각각을 다음 중 "
+            "하나로 분류하라:\n"
+            "   - agreed: 참가자들이 사실상 같은 결론·입장에 도달\n"
+            "   - partial: 큰 틀(프레임/방향)은 같으나 세부에서 갈림\n"
+            "   - contested: 입장이 명확히 갈림\n"
+            "2) 각 참가자의 입장을 요약하라.\n"
+            "3) convergence_score(0.0~1.0)를 매겨라. 앵커:\n"
+            "   - 0.0 모든 핵심 쟁점이 대립 / 0.25 공통 전제는 있으나 결론 대부분 대립\n"
+            "   - 0.5 핵심 쟁점 절반쯤 합의 / 0.75 대부분 합의, 세부만 이견\n"
+            "   - 1.0 모든 핵심 쟁점 합의(표현 차이만 남음)\n"
+            "   ※ 참가자들이 같은 프레임·입장을 채택했다면 세부 구현 이견이 남아도 "
+            "그 자체로 0.6 이상이다. 토론은 단계가 진행될수록 수렴함을 반영하라.\n\n"
+            "아래 JSON 스키마로만 응답하라:\n"
             '{"agent_summaries": [{"agent_id": "...", "initial_claim": "...", '
             '"current_stance": "...", "stance_shift": "..."}], '
+            '"issue_points": [{"issue": "...", "status": "agreed|partial|contested"}], '
             '"key_conflicts": ["..."], "convergence_score": 0.0}\n'
             f"- agent_id 는 반드시 다음 중 하나: {agent_ids}\n"
-            "- convergence_score 는 0.0~1.0 실수. 모든 텍스트는 한국어."
+            "- 모든 텍스트는 한국어."
         )
         raw = await self._invoke_agent(_llm_agent(state), system, user)
         data = _extract_json(raw)
@@ -1655,8 +1728,16 @@ class Orchestrator:
                 current_stance=str(item.get("current_stance", "")),
                 stance_shift=str(item.get("stance_shift", "")),
             ))
-        score = max(0.0, min(1.0, float(data.get("convergence_score", 0.0) or 0.0)))
+        score = _convergence_from_summary(data)
+        # key_conflicts 가 비어 있으면 대립(contested) 항목으로 채운다.
         conflicts = [str(c) for c in data.get("key_conflicts", []) if c]
+        if not conflicts:
+            conflicts = [
+                str(p.get("issue", "")) for p in data.get("issue_points", [])
+                if isinstance(p, dict)
+                and str(p.get("status", "")).lower() == "contested"
+                and p.get("issue")
+            ]
         return PhaseSummary(phase=phase, agent_summaries=summaries,
                             key_conflicts=conflicts, convergence_score=score)
 

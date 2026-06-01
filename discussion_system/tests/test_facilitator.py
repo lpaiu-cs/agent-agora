@@ -51,10 +51,10 @@ async def test_facilitator_notes_at_phase_boundaries(
     assert kinds.count("between") == 4   # debate 5단계 — 단계 사이 4회
 
 
-async def test_facilitator_failure_does_not_block_discussion(
+async def test_facilitator_failure_surfaces_visible_warning_note(
     orchestrator, make_state, make_agent, patch_llm,
 ):
-    """사회자 LLM 호출이 실패해도 토론은 끝까지 진행된다 (비치명적 레이어)."""
+    """사회자 LLM 실패는 토론을 막지 않되, '보이는 경고 노트'로 남는다(침묵 금지)."""
     async def fake(client, model, system, user, temperature, max_tokens, on_token):
         if "사회자 작업" in user:
             raise RuntimeError("사회자 모델 장애")
@@ -73,7 +73,10 @@ async def test_facilitator_failure_does_not_block_discussion(
 
     st = await database.load_state("facfail")
     assert st.status is DiscussionStatus.COMPLETED   # 사회자 실패에도 정상 종료
-    assert st.facilitator_notes == []                # 실패한 노트는 적재 안 됨
+    # 개회·중간·폐회 실패는 보이는 경고 노트로 남는다 — 사용자가 원인을 알 수 있게.
+    assert st.facilitator_notes, "사회자 실패가 침묵 처리됨 — 경고 노트가 없다"
+    assert all(n.metadata.get("failed") for n in st.facilitator_notes)
+    assert all("시스템 경고" in n.content for n in st.facilitator_notes)
 
 
 async def test_no_facilitator_yields_no_notes(

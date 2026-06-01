@@ -1,8 +1,13 @@
-"""manager.py 순수 헬퍼 — 환경변수 파싱, 시스템 LLM 에이전트 선택."""
+"""manager.py 순수 헬퍼 — 환경변수 파싱, 시스템 LLM 에이전트 선택, 합의 근접도."""
 import pytest
 
 from app import manager
-from app.manager import _llm_agent, _positive_int_env, _split_reasoning_draft
+from app.manager import (
+    _convergence_from_summary,
+    _llm_agent,
+    _positive_int_env,
+    _split_reasoning_draft,
+)
 from app.schemas import AgentConfig, DiscussionState, ModelProvider
 
 
@@ -45,6 +50,35 @@ def test_llm_agent_falls_back_when_all_manual():
 
 def test_fallback_model_default_is_gpt_4o_mini():
     assert manager._FALLBACK_LLM_MODEL == "gpt-4o-mini"
+
+
+def test_convergence_from_issue_points_distribution():
+    # 모든 쟁점 합의 → 1.0, 모든 쟁점 대립 → 0.0.
+    assert _convergence_from_summary(
+        {"issue_points": [{"status": "agreed"}, {"status": "agreed"}]}) == 1.0
+    assert _convergence_from_summary(
+        {"issue_points": [{"status": "contested"}, {"status": "contested"}]}) == 0.0
+    # 합의2·부분합의1·대립1 → (1+1+0.5+0)/4 = 0.625, 직출 점수 없으면 그대로.
+    score = _convergence_from_summary({"issue_points": [
+        {"status": "agreed"}, {"status": "agreed"},
+        {"status": "partial"}, {"status": "contested"}]})
+    assert abs(score - 0.625) < 1e-9
+
+
+def test_convergence_averages_derived_and_holistic():
+    # issue_points(파생=1.0) 와 직출 convergence_score(0.4) 가 둘 다 있으면 평균.
+    score = _convergence_from_summary({
+        "issue_points": [{"status": "agreed"}],
+        "convergence_score": 0.4})
+    assert abs(score - 0.7) < 1e-9
+
+
+def test_convergence_falls_back_to_holistic_when_no_points():
+    # issue_points 가 없으면 모델의 convergence_score 를 그대로 (구버전 호환).
+    assert _convergence_from_summary({"convergence_score": 0.55}) == 0.55
+    # 둘 다 없으면 0.0, 범위 밖 값은 클램프.
+    assert _convergence_from_summary({}) == 0.0
+    assert _convergence_from_summary({"convergence_score": 1.7}) == 1.0
 
 
 def test_split_reasoning_draft():
