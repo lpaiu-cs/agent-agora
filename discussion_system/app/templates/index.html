@@ -202,6 +202,18 @@ const PERSONA_LABEL = {
 const PROVIDERS = [['openai', 'OpenAI'], ['anthropic', 'Anthropic'],
                    ['deepseek', 'DeepSeek'], ['ollama', 'Ollama'],
                    ['manual', 'Manual Tunnel']];
+// 공급자별 대표 모델 — 첫 항목이 기본값. '기타(직접 입력)' 옵션이 자동으로
+// 끝에 붙어, 목록 외 모델도 막지 않는다 (오타 방지 + 자유도).
+const MODELS_BY_PROVIDER = {
+  openai:    ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1',
+              'o3-mini', 'o4-mini'],
+  anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-7',
+              'claude-3-5-haiku-latest', 'claude-3-5-sonnet-latest'],
+  deepseek:  ['deepseek-chat', 'deepseek-reasoner'],
+  ollama:    ['llama3.2', 'llama3.1', 'mistral', 'qwen2.5', 'gemma2', 'phi3'],
+  manual:    ['manual'],
+};
+const MODEL_CUSTOM_VALUE = '__custom__';   // '기타(직접 입력)' 옵션의 sentinel
 const PTYPES = [['ideator', '아이디어 발상가'], ['builder', '아이디어 확장가'],
                 ['critic', '비판적 검토자'], ['synthesizer', '통합·정리자'],
                 ['pragmatist', '실용성 검토자'], ['neutral', '자유 참여자']];
@@ -312,6 +324,53 @@ function updateUsagePill() {
 }
 
 // ---- 세팅 존: 에이전트 슬롯 -------------------------------------------------
+// 공급자별 모델 옵션을 채운다. ``current`` 가 목록에 있으면 선택, 없으면 '기타'
+// 로 떨어지고 커스텀 입력란에 값이 들어간다.
+function populateModelOptions(selectEl, provider, current) {
+  const models = MODELS_BY_PROVIDER[provider] || [];
+  const opts = models.map((m) =>
+    `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`);
+  opts.push(`<option value="${MODEL_CUSTOM_VALUE}">기타 (직접 입력)</option>`);
+  selectEl.innerHTML = opts.join('');
+  const slot = selectEl.closest('.agent-slot') || selectEl.closest('.facilitator-slot');
+  const customEl = slot
+    && (slot.querySelector('.a-model-custom') || slot.querySelector('.f-model-custom'));
+  if (current && models.includes(current)) {
+    selectEl.value = current;
+    if (customEl) { customEl.value = ''; }
+  } else if (current) {
+    selectEl.value = MODEL_CUSTOM_VALUE;     // 목록 외 모델 → 기타로
+    if (customEl) { customEl.value = current; }
+  } else {
+    selectEl.value = models[0] || MODEL_CUSTOM_VALUE;
+    if (customEl) { customEl.value = ''; }
+  }
+  updateCustomVisibility(selectEl);
+}
+
+// '기타' 선택 시 커스텀 입력란을 보이고, 그 외엔 감춘다.
+function updateCustomVisibility(selectEl) {
+  const slot = selectEl.closest('.agent-slot') || selectEl.closest('.facilitator-slot');
+  if (!slot) return;
+  const customEl = slot.querySelector('.a-model-custom') || slot.querySelector('.f-model-custom');
+  if (!customEl) return;
+  if (selectEl.value === MODEL_CUSTOM_VALUE) {
+    customEl.classList.remove('hidden');
+  } else {
+    customEl.classList.add('hidden');
+  }
+}
+
+// 슬롯에서 실효 모델명을 읽는다 — '기타' 선택 시 커스텀 입력란, 아니면 select 값.
+function readSlotModel(slot, selectClass, customClass) {
+  const sel = slot.querySelector(selectClass);
+  if (!sel) return '';
+  if (sel.value === MODEL_CUSTOM_VALUE) {
+    return (slot.querySelector(customClass).value || '').trim();
+  }
+  return sel.value.trim();
+}
+
 function addAgentSlot(preset) {
   preset = preset || { name: '', provider: 'openai', model: 'gpt-4o-mini',
                        ptype: 'neutral', persona: '' };
@@ -332,8 +391,9 @@ function addAgentSlot(preset) {
       <select class="a-provider flex-1 px-2 py-1 text-sm border border-slate-300 rounded">${provOpts}</select>
       <select class="a-ptype flex-1 px-2 py-1 text-sm border border-slate-300 rounded">${ptypeOpts}</select>
     </div>
-    <input class="a-model w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
-           placeholder="모델명 (예: gpt-4o-mini)" value="${escapeHtml(preset.model)}" />
+    <select class="a-model-select w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"></select>
+    <input class="a-model-custom hidden w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
+           placeholder="모델명 직접 입력 (예: gpt-4o-2024-11-20)" />
     <textarea class="a-persona w-full px-2 py-1 text-sm border border-slate-300 rounded"
               rows="2" placeholder="페르소나 프롬프트 — 대강 써도 됩니다">${escapeHtml(preset.persona)}</textarea>
     <button class="a-refine w-full mt-1 text-[11px] py-1 rounded bg-violet-600 text-white
@@ -344,10 +404,21 @@ function addAgentSlot(preset) {
       <input type="checkbox" class="a-intercept" />
       🔍 발언 전 검토 (가로채기)
     </label>`;
+  // 모델 옵션 초기 적재 — 공급자 변경 시엔 기본값으로 재적재.
+  const modelSel = slot.querySelector('.a-model-select');
+  populateModelOptions(modelSel, preset.provider, preset.model);
+  slot.querySelector('.a-provider').addEventListener('change', (e) => {
+    populateModelOptions(modelSel, e.target.value, '');
+  });
+  modelSel.addEventListener('change', () => updateCustomVisibility(modelSel));
   slot.querySelector('.del-slot').addEventListener('click', () => slot.remove());
   slot.querySelector('.a-refine').addEventListener('click', () => refinePersona(slot));
   slot.querySelector('.a-intercept').addEventListener('change', onInterceptToggle);
   $('agentSlots').appendChild(slot);
+}
+
+function defaultModelFor(provider) {
+  return (MODELS_BY_PROVIDER[provider] || ['gpt-4o-mini'])[0];
 }
 
 function collectAgents() {
@@ -358,11 +429,14 @@ function collectAgents() {
     const persona = slot.querySelector('.a-persona').value.trim();
     if (!name || !persona) return;
     n += 1;
+    const provider = slot.querySelector('.a-provider').value;
+    const model = readSlotModel(slot, '.a-model-select', '.a-model-custom')
+                  || defaultModelFor(provider);
     agents.push({
       agent_id: 'a' + n,
       name: name,
-      model: slot.querySelector('.a-model').value.trim() || 'gpt-4o-mini',
-      provider: slot.querySelector('.a-provider').value,
+      model: model,
+      provider: provider,
       persona_type: slot.querySelector('.a-ptype').value,
       persona_prompt: persona,
     });
@@ -381,11 +455,19 @@ function buildFacilitatorSlot() {
       <input class="f-name w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
              placeholder="사회자 이름" value="사회자" />
       <select class="f-provider w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded">${provOpts}</select>
-      <input class="f-model w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
-             placeholder="모델명 (예: gpt-4o-mini)" value="gpt-4o-mini" />
+      <select class="f-model-select w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"></select>
+      <input class="f-model-custom hidden w-full mb-2 px-2 py-1 text-sm border border-slate-300 rounded"
+             placeholder="모델명 직접 입력 (예: claude-opus-4-7-20250929)" />
       <textarea class="f-persona w-full px-2 py-1 text-sm border border-slate-300 rounded"
                 rows="2" placeholder="진행 스타일 — 예: 핵심 쟁점을 짚어주는 진행자">중립적으로 핵심 쟁점을 짚고, 토론이 한쪽으로 치우치지 않게 조율한다.</textarea>
     </div>`;
+  const slot = $('facilitatorSlot');
+  const modelSel = slot.querySelector('.f-model-select');
+  populateModelOptions(modelSel, 'openai', 'gpt-4o-mini');
+  slot.querySelector('.f-provider').addEventListener('change', (e) => {
+    populateModelOptions(modelSel, e.target.value, '');
+  });
+  modelSel.addEventListener('change', () => updateCustomVisibility(modelSel));
 }
 
 function collectFacilitator() {
@@ -394,10 +476,13 @@ function collectFacilitator() {
   const name = slot.querySelector('.f-name').value.trim();
   const persona = slot.querySelector('.f-persona').value.trim();
   if (!name || !persona) return null;
+  const provider = slot.querySelector('.f-provider').value;
+  const model = readSlotModel(slot, '.f-model-select', '.f-model-custom')
+                || defaultModelFor(provider);
   return {
     agent_id: 'facilitator', name: name,
-    model: slot.querySelector('.f-model').value.trim() || 'gpt-4o-mini',
-    provider: slot.querySelector('.f-provider').value,
+    model: model,
+    provider: provider,
     persona_prompt: persona,
   };
 }
@@ -407,7 +492,7 @@ async function refinePersona(slot) {
   const topic = $('topicInput').value.trim();
   const draft = slot.querySelector('.a-persona').value.trim();
   const provider = slot.querySelector('.a-provider').value;
-  const model = slot.querySelector('.a-model').value.trim() || 'gpt-4o-mini';
+  const model = readSlotModel(slot, '.a-model-select', '.a-model-custom') || 'gpt-4o-mini';
   if (!topic) { alert('먼저 토론 주제를 입력하세요.'); return; }
   if (!draft) { alert('윤문할 페르소나 초안을 먼저 입력하세요. (대강 써도 됩니다)'); return; }
   if (provider === 'manual') {
