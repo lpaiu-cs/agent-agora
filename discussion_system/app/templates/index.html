@@ -621,15 +621,221 @@ function enterViewMode(markdown, filename) {
   $('topicCard').classList.add('hidden');
   // 시작 버튼은 비활성화 — 불러온 토론은 이어갈 수 없다.
   $('startBtn').disabled = true;
-  // placeholder 가 있으면 제거하고, 통째 렌더한 카드 하나로 채운다.
   clearTimeline();
   const ph = $('placeholder'); if (ph) ph.remove();
-  const card = document.createElement('article');
-  card.id = 'loadedCard';
-  card.className = 'md bg-white border border-slate-200 rounded-lg p-5';
-  card.innerHTML = renderMarkdown(markdown);
-  timelineEl.appendChild(card);
+  // Agora 기록(render_transcript 출력)이면 라이브 UI 와 같은 구조로 복원한다.
+  // 패턴 매칭이라 엄밀하진 않다 — 실패하면 통째 마크다운 렌더로 폴백한다.
+  let structured = false;
+  try { structured = renderLoadedTranscript(markdown); } catch (e) { structured = false; }
+  if (!structured) {
+    const card = document.createElement('article');
+    card.id = 'loadedCard';
+    card.className = 'md bg-white border border-slate-200 rounded-lg p-5';
+    card.innerHTML = renderMarkdown(markdown);
+    timelineEl.appendChild(card);
+  }
   setStatus('📂 ' + filename + ' (읽기 전용)', '');
+}
+
+// ---- 저장된 .md 토론을 라이브 UI 구조로 복원 (패턴 기반, 비엄밀) ------------
+// 아카이브 .md 는 render_transcript 가 만든 규칙적 포맷이다:
+//   # Agent Agora — <주제>           (주제는 멀티라인 마크다운)
+//   - 형식/상태/생성 (메타 불릿)
+//   ## 참여 에이전트  ← 구조화 본문의 시작점(항상 존재)
+//   ## <단계 라벨> → ### <발언자> → 본문 → _단계 요약…_ → **사회자 · …**
+//   ## 사회자 — 개회/폐회, ## 최종 합의안 …
+// 주제 자체가 ##/### 를 쓰므로, '## 참여 에이전트' 를 경계로 머리말/본문을 가른다.
+function parseAgoraTranscript(md) {
+  const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
+  let bodyStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+참여 에이전트\s*$/.test(lines[i])) { bodyStart = i; break; }
+  }
+  if (bodyStart < 0) return null;   // Agora 기록 아님 → 폴백
+
+  // 머리말 = 제목 + 주제 + 메타 불릿. 제목 프리픽스 제거 + 끝의 메타 불릿 제거 = 주제.
+  const pre = lines.slice(0, bodyStart);
+  for (let i = 0; i < pre.length; i++) {
+    const m = pre[i].match(/^#\s+Agent Agora\s+—\s*(.*)$/);
+    if (m) { pre[i] = m[1]; break; }
+  }
+  while (pre.length) {
+    const last = pre[pre.length - 1].trim();
+    if (last === '' || /^- (형식|상태|생성|갱신|토큰)/.test(last)) pre.pop();
+    else break;
+  }
+  const topic = pre.join('\n').trim();
+
+  // 본문을 '## ' 헤더로 분할 (주제 영역은 이미 제외됨).
+  const sections = [];
+  let cur = null;
+  for (const line of lines.slice(bodyStart)) {
+    const m = line.match(/^##\s+(.+?)\s*$/);
+    if (m) { cur = { header: m[1].trim(), lines: [] }; sections.push(cur); }
+    else if (cur) cur.lines.push(line);
+  }
+
+  const out = { topic: topic, agents: [], facilitator: null, preInstructions: [],
+                openNote: null, closeNote: null, agreement: null, phases: [] };
+  for (const sec of sections) {
+    const h = sec.header;
+    if (h === '참여 에이전트') {
+      for (const ln of sec.lines) {
+        let m = ln.match(/^-\s+\*\*(.+?)\*\*\s+\(`([^`]+)`\)\s+—\s+(.+)$/);
+        if (m) { out.agents.push({ name: m[1], id: m[2], model: m[3] }); continue; }
+        m = ln.match(/^-\s+사회자:\s*\*\*(.+?)\*\*\s+—\s+(.+)$/);
+        if (m) out.facilitator = { name: m[1], model: m[2] };
+      }
+    } else if (h === '진행자 사전 지시') {
+      for (const ln of sec.lines) {
+        const m = ln.match(/^>\s?(.*)$/);
+        if (m && m[1].trim()) out.preInstructions.push(m[1].trim());
+      }
+    } else if (h === '사회자 — 개회') {
+      out.openNote = sec.lines.join('\n').trim();
+    } else if (h === '사회자 — 폐회') {
+      out.closeNote = sec.lines.join('\n').trim();
+    } else if (h === '최종 합의안') {
+      out.agreement = sec.lines.join('\n').trim();
+    } else {
+      out.phases.push(parsePhaseSection(h, sec.lines));
+    }
+  }
+  return out;
+}
+
+function parsePhaseSection(label, lines) {
+  const phase = { label: label, turns: [], summary: null,
+                  interventions: [], notes: [] };
+  let mode = null, speaker = null, noteKind = null, buf = [];
+  const flush = () => {
+    const content = buf.join('\n').trim();
+    if (mode === 'turn' && speaker !== null) phase.turns.push({ speaker, content });
+    else if (mode === 'note' && noteKind !== null) phase.notes.push({ kind: noteKind, content });
+    buf = []; mode = null; speaker = null; noteKind = null;
+  };
+  for (const ln of lines) {
+    let m = ln.match(/^###\s+(.+?)\s*$/);
+    if (m) { flush(); mode = 'turn'; speaker = m[1].trim(); continue; }
+    m = ln.match(/^\*\*사회자 · (.+?)\*\*\s*$/);
+    if (m) { flush(); mode = 'note'; noteKind = m[1].trim(); continue; }
+    m = ln.match(/^_단계 요약 · 합의 근접도 (\d+)%_/);
+    if (m) { flush(); phase.summary = phase.summary || {}; phase.summary.pct = +m[1]; continue; }
+    m = ln.match(/^_주요 쟁점:\s*(.+?)_\s*$/);
+    if (m) { phase.summary = phase.summary || {}; phase.summary.conflicts = m[1].trim(); continue; }
+    m = ln.match(/^>\s*진행자 개입:\s*(.+)$/);
+    if (m) { flush(); phase.interventions.push(m[1].trim()); continue; }
+    buf.push(ln);
+  }
+  flush();
+  return phase;
+}
+
+// 발언자 → 말풍선 색 (persona_type 은 기록에 없으므로 등장 순서로 팔레트 순환).
+const LOADED_BUBBLE_PALETTE = ['ideator', 'builder', 'critic',
+                               'synthesizer', 'pragmatist', 'analyst'];
+
+function renderLoadedTranscript(md) {
+  const parsed = parseAgoraTranscript(md);
+  if (!parsed) return false;
+  const speakerColor = {};
+  parsed.agents.forEach((a, i) => {
+    speakerColor[a.name] = LOADED_BUBBLE_PALETTE[i % LOADED_BUBBLE_PALETTE.length];
+  });
+  const frag = document.createDocumentFragment();
+
+  if (parsed.topic) {
+    const t = document.createElement('div');
+    t.className = 'bg-white border border-slate-200 rounded-lg p-3 mb-4';
+    t.innerHTML =
+      '<label class="block text-xs font-semibold text-slate-500 mb-1">📌 토론 주제</label>'
+      + '<div class="md text-sm text-slate-800 leading-relaxed">'
+      + renderMarkdown(parsed.topic) + '</div>';
+    frag.appendChild(t);
+  }
+  if (parsed.agents.length || parsed.facilitator) {
+    const roster = parsed.agents.map((a) => a.name + ' (' + a.model + ')');
+    if (parsed.facilitator) {
+      roster.push('🎙 ' + parsed.facilitator.name + ' (' + parsed.facilitator.model + ')');
+    }
+    const r = document.createElement('div');
+    r.className = 'text-xs text-slate-500 mb-4';
+    r.textContent = '👥 ' + roster.join(' · ');
+    frag.appendChild(r);
+  }
+  parsed.preInstructions.forEach((msg) =>
+    frag.appendChild(buildHintCard('🙋 참가자 H 사전 지시', msg)));
+  if (parsed.openNote) frag.appendChild(buildFacNoteCard('개회', parsed.openNote));
+
+  parsed.phases.forEach((ph) => {
+    const sec = document.createElement('section');
+    sec.className = 'mb-6';
+    sec.innerHTML =
+      '<h3 class="text-sm font-bold text-slate-500 border-b border-slate-200 pb-1 mb-3">'
+      + escapeHtml(ph.label) + '</h3>';
+    const body = document.createElement('div');
+    body.className = 'space-y-3';
+    sec.appendChild(body);
+    ph.turns.forEach((t) =>
+      body.appendChild(buildBubbleCard(t.speaker, t.content,
+                                       speakerColor[t.speaker] || 'neutral')));
+    if (ph.summary) body.appendChild(buildSummaryCard(ph.summary));
+    ph.interventions.forEach((msg) =>
+      body.appendChild(buildHintCard('🙋 참가자 H 개입', msg)));
+    ph.notes.forEach((n) => body.appendChild(buildFacNoteCard(n.kind, n.content)));
+    frag.appendChild(sec);
+  });
+
+  if (parsed.closeNote) frag.appendChild(buildFacNoteCard('폐회', parsed.closeNote));
+  if (parsed.agreement) {
+    const a = document.createElement('div');
+    a.className = 'bubble bubble--consensus rounded-lg p-4 my-3';
+    a.innerHTML =
+      '<div class="text-sm font-bold text-teal-700 mb-1">🤝 최종 합의안</div>'
+      + '<div class="text-sm text-slate-800 leading-relaxed md">'
+      + renderMarkdown(parsed.agreement) + '</div>';
+    frag.appendChild(a);
+  }
+  timelineEl.appendChild(frag);
+  return true;
+}
+
+function buildBubbleCard(name, content, ptype) {
+  const wrap = document.createElement('div');
+  const warn = (content || '').startsWith('[시스템 경고');
+  wrap.className = 'bubble bubble--' + (warn ? 'warning' : ptype) + ' rounded-lg p-3';
+  wrap.innerHTML =
+    '<div class="flex items-center gap-2 mb-1">'
+    + '<span class="text-xs font-bold text-slate-700">' + escapeHtml(name) + '</span></div>'
+    + '<div class="text-sm text-slate-800 md">' + renderMarkdown(content) + '</div>';
+  return wrap;
+}
+function buildSummaryCard(s) {
+  const div = document.createElement('div');
+  div.className = 'text-xs bg-slate-100 border border-slate-200 rounded-lg p-3';
+  div.innerHTML =
+    '<div class="font-bold text-slate-600 mb-1">📊 단계 요약 · 합의 근접도 '
+    + (s.pct || 0) + '%</div>'
+    + (s.conflicts ? '<div class="text-slate-500">주요 쟁점: '
+                     + escapeHtml(s.conflicts) + '</div>' : '');
+  return div;
+}
+function buildHintCard(title, msg) {
+  const div = document.createElement('div');
+  div.className = 'bubble--hint rounded-lg p-3 my-2';
+  div.innerHTML =
+    '<div class="text-xs font-bold text-amber-700 mb-1">' + escapeHtml(title) + '</div>'
+    + '<div class="text-sm text-slate-800 md">' + renderMarkdown(msg) + '</div>';
+  return div;
+}
+function buildFacNoteCard(kindLabel, content) {
+  const div = document.createElement('div');
+  div.className = 'facilitator-note rounded-lg p-3 my-3';
+  div.innerHTML =
+    '<div class="text-xs font-bold text-teal-700 mb-1">🎙 사회자 · '
+    + escapeHtml(kindLabel) + '</div>'
+    + '<div class="text-sm text-slate-800 md">' + renderMarkdown(content) + '</div>';
+  return div;
 }
 
 // 현재 토론의 전체 기록을 마크다운 파일로 로컬 discussions/ 폴더에 저장한다.
