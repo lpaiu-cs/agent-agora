@@ -40,6 +40,7 @@ class ModelProvider(str, Enum):
 
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    GEMINI = "gemini"       # Google — OpenAI-호환 엔드포인트 (generativelanguage.googleapis.com)
     DEEPSEEK = "deepseek"   # OpenAI-호환 API (api.deepseek.com)
     OLLAMA = "ollama"
     MANUAL = "manual"  # API 미호출 — 유저가 웹 UI 에서 복붙으로 응답 주입
@@ -127,6 +128,10 @@ class AgentConfig(BaseModel):
             return ModelProvider.OPENAI
         if name.startswith("claude"):
             return ModelProvider.ANTHROPIC
+        # Gemini(Google)는 OpenAI-호환 엔드포인트로 — 로컬 Ollama 의 'gemma' 와
+        # 프리픽스가 달라 충돌하지 않는다.
+        if name.startswith("gemini"):
+            return ModelProvider.GEMINI
         # DeepSeek 모델은 api.deepseek.com 의 OpenAI-호환 엔드포인트로 — Ollama
         # 로컬에서 돌리려면 provider=ollama 를 명시.
         if name.startswith("deepseek"):

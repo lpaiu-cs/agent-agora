@@ -19,11 +19,14 @@ def _two_agents():
     ("o3-mini", ModelProvider.OPENAI),
     ("chatgpt-4o-latest", ModelProvider.OPENAI),
     ("claude-opus-4-7", ModelProvider.ANTHROPIC),
+    ("gemini-2.5-flash", ModelProvider.GEMINI),
+    ("gemini-2.0-pro", ModelProvider.GEMINI),
     ("deepseek-chat", ModelProvider.DEEPSEEK),
     ("deepseek-reasoner", ModelProvider.DEEPSEEK),
     ("llama3.1", ModelProvider.OLLAMA),
     ("mistral-large", ModelProvider.OLLAMA),
     ("qwen2.5", ModelProvider.OLLAMA),
+    ("gemma2", ModelProvider.OLLAMA),   # 로컬 gemma — Gemini 와 혼동 금지
 ])
 def test_get_provider_inferred_from_model(model, expected):
     assert _agent(model).get_provider() is expected

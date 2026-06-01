@@ -200,8 +200,8 @@ const PERSONA_LABEL = {
   mediator: '중재자', analyst: '분석가',
 };
 const PROVIDERS = [['openai', 'OpenAI'], ['anthropic', 'Anthropic'],
-                   ['deepseek', 'DeepSeek'], ['ollama', 'Ollama'],
-                   ['manual', 'Manual Tunnel']];
+                   ['gemini', 'Gemini (Google)'], ['deepseek', 'DeepSeek'],
+                   ['ollama', 'Ollama'], ['manual', 'Manual Tunnel']];
 // 공급자별 대표 모델 — 첫 항목이 기본값. '기타(직접 입력)' 옵션이 자동으로
 // 끝에 붙어, 목록 외 모델도 막지 않는다 (오타 방지 + 자유도).
 const MODELS_BY_PROVIDER = {
@@ -209,6 +209,8 @@ const MODELS_BY_PROVIDER = {
               'o3-mini', 'o4-mini'],
   anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-7',
               'claude-3-5-haiku-latest', 'claude-3-5-sonnet-latest'],
+  gemini:    ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash',
+              'gemini-2.0-flash-lite'],
   deepseek:  ['deepseek-chat', 'deepseek-reasoner'],
   ollama:    ['llama3.2', 'llama3.1', 'mistral', 'qwen2.5', 'gemma2', 'phi3'],
   manual:    ['manual'],

@@ -14,7 +14,7 @@
 - **다중 토론 형식** — 구조화 토론(5단계)·브레인스토밍(4단계)·소크라테스식 문답(가변 길이). 형식마다 단계 구성·프롬프트가 다르며 코드로 추가 가능
 - **가변 길이 형식** — 반복(`repeatable`) 단계가 합의 근접도에 따라 라운드를 거듭한다 (소크라테스식 문답의 문답 라운드)
 - **사회자(facilitator) 에이전트** — 선택적 사회자가 단계 경계에서 개회·중간 조율·폐회로 진행을 조율하고, 가변 길이 형식에서는 반복 라운드 지속 여부까지 판단 (토론자가 아닌 부가 레이어)
-- **멀티 공급자 LLM** — OpenAI · Anthropic · DeepSeek · Ollama, 그리고 복붙 기반 `manual` 공급자
+- **멀티 공급자 LLM** — OpenAI · Anthropic · Gemini · DeepSeek · Ollama, 그리고 복붙 기반 `manual` 공급자
 - **토큰 단위 실시간 스트리밍** — WebSocket 으로 발언이 생성되는 과정을 그대로 전송
 - **이벤트 구동형 무상태 오케스트레이션** — 매 이벤트가 `DB 로드 → 전이 → 저장 → 종료`,
   단계 사이·입력 대기 중 메모리 점유 0
@@ -154,6 +154,7 @@ cp .env.example .env
 |------|------|
 | `OPENAI_API_KEY` | OpenAI(gpt-*) 공급자 사용 시 필수 |
 | `ANTHROPIC_API_KEY` | Anthropic(claude-*) 공급자 사용 시 필수 |
+| `GEMINI_API_KEY` | Gemini(gemini-*) 공급자 사용 시 필수 (`GOOGLE_API_KEY` 도 인식) — Google 의 OpenAI-호환 엔드포인트 사용 |
 | `DEEPSEEK_API_KEY` | DeepSeek(deepseek-*) 공급자 사용 시 필수 — `api.deepseek.com` 의 OpenAI-호환 엔드포인트 사용 |
 | `OLLAMA_HOST` | (선택) Ollama 호스트 주소. 기본 `http://localhost:11434` |
 | `DATABASE_URL` | (선택) 비동기 DB URL. 기본 `sqlite+aiosqlite:///./agora.db`. `postgresql+asyncpg://…` 도 그대로 수용 (`AGORA_DB_URL` 은 하위 호환 폴백) |
@@ -259,8 +260,10 @@ curl -X POST http://127.0.0.1:8000/discussions \
 ## 공급자 선택과 `manual` 복붙 터널
 
 `AgentConfig.provider` 로 공급자를 명시하거나, 생략 시 `model` 명 접두사에서
-추론한다 (`gpt*`·`o1/o3/o4*` → OpenAI, `claude*` → Anthropic,
-`llama*`·`mistral*`·`qwen*` 등 → Ollama).
+추론한다 (`gpt*`·`o1/o3/o4*` → OpenAI, `claude*` → Anthropic, `gemini*` →
+Gemini, `deepseek*` → DeepSeek, `llama*`·`mistral*`·`qwen*`·`gemma*` 등 →
+Ollama). Gemini·DeepSeek 은 각자의 OpenAI-호환 엔드포인트를 쓰며, 로컬 Ollama
+의 `gemma*` 와 Google `gemini*` 는 접두사가 달라 충돌하지 않는다.
 
 `provider="manual"` 인 에이전트는 API 를 호출하지 않는다. 그 턴이 오면 세션이
 `pending_manual_input` 으로 대기하고, 웹 UI 에 딥/일반 복사본과 붙여넣기 창이

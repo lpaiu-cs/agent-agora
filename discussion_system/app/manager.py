@@ -217,6 +217,19 @@ def _build_client(provider: ModelProvider) -> object:
         if not api_key:
             raise DiscussionError("환경 변수 DEEPSEEK_API_KEY 가 설정되지 않았습니다.")
         return AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    if provider is ModelProvider.GEMINI:
+        # Gemini(Google)도 OpenAI-호환 엔드포인트를 제공 — 같은 AsyncOpenAI 재사용.
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise DiscussionError("openai 패키지가 설치되지 않았습니다.") from exc
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise DiscussionError(
+                "환경 변수 GEMINI_API_KEY (또는 GOOGLE_API_KEY) 가 설정되지 않았습니다.")
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
     if provider is ModelProvider.OLLAMA:
         try:
             from ollama import AsyncClient
@@ -1509,8 +1522,9 @@ class Orchestrator:
         provider = agent.get_provider()
         client = self._pool.get(provider)
         async with self._llm_semaphore:
-            if provider is ModelProvider.OPENAI or provider is ModelProvider.DEEPSEEK:
-                # DeepSeek 은 OpenAI 호환 — 같은 스트리밍 경로(_call_openai) 재사용.
+            if provider in (ModelProvider.OPENAI, ModelProvider.DEEPSEEK,
+                            ModelProvider.GEMINI):
+                # DeepSeek·Gemini 는 OpenAI 호환 — 같은 스트리밍 경로 재사용.
                 result = await _call_openai(
                     client, agent.model, system, user,
                     agent.temperature, agent.max_tokens, on_token)
