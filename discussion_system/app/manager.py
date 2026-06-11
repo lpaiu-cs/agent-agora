@@ -15,6 +15,7 @@ phase-6: 토론 전체를 점유하던 거대한 ``_run_pipeline`` while/for 루
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -811,18 +812,51 @@ def render_transcript(state: DiscussionState) -> str:
     return "\n".join(lines) + "\n"
 
 
+#: .md 끝에 심는 복원용 상태 블록의 마커. HTML 주석이라 마크다운 렌더에 안 보인다.
+_STATE_BLOCK_RE = re.compile(
+    r"<!--\s*AGORA-STATE-V1\n([A-Za-z0-9+/=\s]+?)\n-->", re.DOTALL)
+
+
+def render_transcript_with_state(state: DiscussionState) -> str:
+    """기록 문서 + 복원용 상태 블록.
+
+    사람이 읽는 마크다운 본문은 ``render_transcript`` 그대로 두고, 끝에 전체
+    ``DiscussionState`` 를 base64(JSON) HTML 주석으로 심는다 — .md 파일 하나가
+    사람용 기록이자 기계용 완전 복원 소스가 된다(별도 sidecar 파일 불필요).
+    base64 인코딩은 본문에 '-->' 같은 문자가 들어가 주석이 깨지는 것을 막는다.
+    """
+    payload = base64.b64encode(
+        state.model_dump_json().encode("utf-8")).decode("ascii")
+    return (render_transcript(state)
+            + f"\n<!-- AGORA-STATE-V1\n{payload}\n-->\n")
+
+
+def extract_embedded_state(markdown: str) -> Optional[DiscussionState]:
+    """.md 의 AGORA-STATE-V1 블록에서 DiscussionState 를 복원한다. 없거나
+    손상됐으면 None (호출부는 패턴 파싱으로 폴백)."""
+    match = _STATE_BLOCK_RE.search(markdown)
+    if not match:
+        return None
+    try:
+        raw = base64.b64decode("".join(match.group(1).split()))
+        return DiscussionState.model_validate_json(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - 손상 블록은 조용히 폴백
+        return None
+
+
 def archive_transcript(state: DiscussionState) -> str:
     """토론 기록을 마크다운 파일로 로컬 폴더에 저장하고 그 경로를 반환한다.
 
     한 토론당 파일 하나(``agora-{id}.md``)이며, 다시 저장하면 최신 상태로
     덮어쓴다. 저장 폴더는 ``AGORA_ARCHIVE_DIR`` 환경변수로 바꿀 수 있다
-    (기본 ``discussions``, 서버 작업 디렉터리 기준 상대 경로).
+    (기본 ``discussions``, 서버 작업 디렉터리 기준 상대 경로). 파일 끝에
+    복원용 상태 블록이 들어가 '불러오기' 가 완벽 복원할 수 있다.
     """
     directory = os.getenv("AGORA_ARCHIVE_DIR", "discussions")
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"agora-{state.discussion_id[:8]}.md")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_transcript(state))
+        fh.write(render_transcript_with_state(state))
     return path
 
 

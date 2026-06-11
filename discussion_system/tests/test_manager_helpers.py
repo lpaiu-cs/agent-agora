@@ -8,10 +8,15 @@ from app.manager import (
     _positive_int_env,
     _render_convergence_trajectory,
     _split_reasoning_draft,
+    extract_embedded_state,
+    render_transcript,
+    render_transcript_with_state,
 )
 from app.schemas import (
     AgentConfig,
+    AgentTurn,
     DiscussionState,
+    FacilitatorNote,
     ModelProvider,
     PhaseSummary,
 )
@@ -102,6 +107,47 @@ def test_render_convergence_trajectory():
     assert "45%" in out and "60%" in out
     # opinion(45%)이 critique(60%)보다 먼저 나온다 — 실행 순서.
     assert out.index("45%") < out.index("60%")
+
+
+# ---------------------------------------------------------------------------
+# .md 내장 상태 블록 — 저장·복원 라운드트립
+# ---------------------------------------------------------------------------
+def _rich_state():
+    """본문에 '-->'·마크다운 헤더 같은 함정 문자를 넣은 상태 (블록 견고성 검증)."""
+    state = _state(ModelProvider.OPENAI, ModelProvider.MANUAL)
+    state.topic = "## 마크다운 주제\n화살표 A --> B 도 있다"
+    state.phase_records = {"opinion": [
+        AgentTurn(agent_id="a0", phase="opinion", content="## 헤더 발언 --> 끝",
+                  metadata={"usage": {"prompt_tokens": 3, "completion_tokens": 7}}),
+    ]}
+    state.phase_summaries = [PhaseSummary(phase="opinion", convergence_score=0.7)]
+    state.facilitator_notes = [
+        FacilitatorNote(phase="opinion", kind="between", content="사회자 노트")]
+    return state
+
+
+def test_transcript_state_block_round_trip():
+    doc = render_transcript_with_state(_rich_state())
+    assert "AGORA-STATE-V1" in doc
+    # 사람용 본문은 그대로 시작하고, 상태 블록은 끝의 HTML 주석이다.
+    assert doc.startswith(render_transcript(_rich_state())[:50])
+    restored = extract_embedded_state(doc)
+    assert restored is not None
+    assert restored.topic == "## 마크다운 주제\n화살표 A --> B 도 있다"
+    assert restored.phase_records["opinion"][0].content == "## 헤더 발언 --> 끝"
+    assert restored.phase_records["opinion"][0].metadata["usage"][
+        "completion_tokens"] == 7
+    assert restored.phase_summaries[0].convergence_score == 0.7
+    assert restored.facilitator_notes[0].kind == "between"
+    assert [a.agent_id for a in restored.agents] == ["a0", "a1"]
+
+
+def test_extract_embedded_state_absent_or_corrupt_returns_none():
+    # 구버전 파일(블록 없음) → None (호출부가 패턴 파싱으로 폴백).
+    assert extract_embedded_state(render_transcript(_rich_state())) is None
+    # 손상된 base64 → None (예외 없이 조용히 폴백).
+    assert extract_embedded_state(
+        "# 문서\n<!-- AGORA-STATE-V1\n!!!깨진페이로드!!!\n-->") is None
 
 
 def test_split_reasoning_draft():

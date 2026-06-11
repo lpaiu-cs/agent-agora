@@ -614,17 +614,40 @@ async function onLoadFileChange(event) {
   }
 }
 
+// .md 끝의 AGORA-STATE-V1 주석 블록(base64 JSON)에서 전체 상태를 복원한다.
+// 블록이 없거나 손상됐으면 null — 호출부가 패턴 파싱으로 폴백한다.
+function extractEmbeddedState(md) {
+  const m = String(md || '').match(/<!--\s*AGORA-STATE-V1\n([A-Za-z0-9+\/=\s]+?)\n-->/);
+  if (!m) return null;
+  try {
+    const bin = atob(m[1].replace(/\s+/g, ''));
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  } catch (e) { return null; }
+}
+
 function enterViewMode(markdown, filename) {
   // 진행 중 세션·소켓이 있으면 모두 정리하고 깨끗한 상태로 진입한다.
   resetDiscussion();
-  // 불러온 파일은 자체 헤더(주제·에이전트 목록 등)를 가지므로 주제 카드는 가린다.
-  $('topicCard').classList.add('hidden');
   // 시작 버튼은 비활성화 — 불러온 토론은 이어갈 수 없다.
   $('startBtn').disabled = true;
   clearTimeline();
   const ph = $('placeholder'); if (ph) ph.remove();
-  // Agora 기록(render_transcript 출력)이면 라이브 UI 와 같은 구조로 복원한다.
-  // 패턴 매칭이라 엄밀하진 않다 — 실패하면 통째 마크다운 렌더로 폴백한다.
+
+  // 1순위: 내장 상태 블록 — 라이브 스냅샷과 같은 경로로 '완벽 복원'
+  //        (persona 색·검토 배지·토큰 사용량·사회자 노트 전부 정확).
+  const state = extractEmbeddedState(markdown);
+  if (state) {
+    try {
+      renderStateContent(state);
+      hideInterventionBar();            // 읽기 전용 — 상호작용 없음
+      setStatus('📂 ' + filename + ' (완벽 복원 · 읽기 전용)', 'done');
+      return;
+    } catch (e) { /* 구조 불일치 — 아래 폴백으로 */ }
+  }
+
+  // 2순위: 패턴 파싱(구버전 파일 — 상태 블록 없음), 3순위: 통째 렌더.
+  $('topicCard').classList.add('hidden');   // 파싱 경로는 자체 주제 카드를 만든다
   let structured = false;
   try { structured = renderLoadedTranscript(markdown); } catch (e) { structured = false; }
   if (!structured) {
@@ -1353,23 +1376,21 @@ async function approveReview(panel) {
   }
 }
 
-function renderSnapshot(state) {
-  // 재연결 시 중복 렌더를 막기 위해 타임라인을 비우고 스냅샷으로 완전 재구성한다.
-  // 단, 비우기 전에 작성 중이던 텍스트를 대피시켜 두고(captureDrafts), 재구성이
-  // 끝난 직후 복원한다(restoreDrafts) — 일시적 단절에도 입력 글자를 잃지 않도록.
-  const drafts = captureDrafts();
+// 상태 객체의 '내용' 만 타임라인에 렌더한다 — 라이브 스냅샷(renderSnapshot)과
+// .md 내장 상태 복원(뷰어)이 공유하는 공통 경로. 상호작용 복구는 하지 않는다.
+function renderStateContent(state) {
   clearTimeline();
   bubbles = {};
   hideInterventionBar();
   agentsById = {};
   (state.agents || []).forEach((a) => { agentsById[a.agent_id] = a; });
   if (state.topic) $('topicInput').value = state.topic;
-  setTopicReadOnly(true);            // 스냅샷이 있다 = 진행 중인 토론 — 주제 고정
+  setTopicReadOnly(true);            // 진행 중/복원 토론 — 주제 고정(마크다운 뷰)
   autoGrowTopic();
   currentFormatId = state.format_id || 'debate';   // 단계 렌더링의 기준 형식
   hasFacilitator = !!state.facilitator;             // postIntervention 분기
 
-  usageTotal = 0;   // 스냅샷 재구성 — 누적 사용량을 0 부터 다시 합산한다
+  usageTotal = 0;   // 재구성 — 누적 사용량을 0 부터 다시 합산한다
   // phase_records 는 단계 인스턴스 키(반복 단계는 'probe#1'…)로, 실행 순서대로
   // 들어 있다 — 가변 길이 형식의 라운드를 그대로 재구성한다.
   Object.values(state.phase_records || {}).forEach((turns) => {
@@ -1379,6 +1400,15 @@ function renderSnapshot(state) {
   (state.facilitator_notes || []).forEach((n) => renderFacilitatorNote(n));
   (state.user_interventions || []).forEach((iv) => renderIntervention(iv));
   if (state.final_joint_agreement) renderAgreement(state.final_joint_agreement);
+  hideInterventionBar();   // renderSummary 의 onAwaitingUser 흔적 방지
+}
+
+function renderSnapshot(state) {
+  // 재연결 시 중복 렌더를 막기 위해 타임라인을 비우고 스냅샷으로 완전 재구성한다.
+  // 단, 비우기 전에 작성 중이던 텍스트를 대피시켜 두고(captureDrafts), 재구성이
+  // 끝난 직후 복원한다(restoreDrafts) — 일시적 단절에도 입력 글자를 잃지 않도록.
+  const drafts = captureDrafts();
+  renderStateContent(state);
 
   if (state.status === 'waiting_for_user') {
     onAwaitingUser({ completed_phase: state.current_phase });

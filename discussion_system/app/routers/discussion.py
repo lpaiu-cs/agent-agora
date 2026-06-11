@@ -28,7 +28,7 @@ from ..manager import (
     Orchestrator,
     PipelineEvent,
     archive_transcript,
-    render_transcript,
+    render_transcript_with_state,
 )
 from ..schemas import (
     CreateDiscussionRequest,
@@ -138,10 +138,14 @@ async def get_discussion(discussion_id: str) -> DiscussionState:
 
 @router.get("/{discussion_id}/export")
 async def export_discussion(discussion_id: str) -> PlainTextResponse:
-    """토론 전체 기록을 마크다운 텍스트 파일로 내려받는다 (종료 여부 무관)."""
+    """토론 전체 기록을 마크다운 텍스트 파일로 내려받는다 (종료 여부 무관).
+
+    파일 끝에 복원용 상태 블록(AGORA-STATE-V1)이 포함돼, '불러오기' 로 다시
+    열면 라이브 UI 그대로 완벽 복원된다.
+    """
     state = await _load_or_404(discussion_id)
     return PlainTextResponse(
-        render_transcript(state),
+        render_transcript_with_state(state),
         media_type="text/markdown; charset=utf-8",
         headers={
             "Content-Disposition":
