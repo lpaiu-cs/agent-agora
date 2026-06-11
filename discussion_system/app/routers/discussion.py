@@ -120,6 +120,7 @@ async def create_discussion(
         agents=req.agents,
         facilitator=req.facilitator,
         force_consensus=req.force_consensus,
+        reference_materials=req.reference_materials,
     )
     await database.insert_state(state)
     orchestrator.trigger(discussion_id, PipelineEvent.START)

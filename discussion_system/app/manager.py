@@ -723,6 +723,13 @@ def _build_prompt(
     history = _render_history(state, phase, prior_turns,
                               force_full=force_full, reader_id=agent.agent_id)
     user_sections = [f"[토론 주제]\n{state.topic}"]
+    # 선택 참고 자료 — 첨부된 토론에서만 인용 규칙이 활성화된다 (옵션, 강제 아님).
+    if state.reference_materials:
+        user_sections.append(
+            f"[참고 자료]\n{state.reference_materials}\n"
+            "(규칙: 주장할 때 가능하면 위 자료의 관련 대목을 인용·참조하라. "
+            "자료와 상충하는 주장을 펼 때는 그 차이를 명시하라.)"
+        )
     if history:
         user_sections.append(history)
     user_sections.append(f"[지금 너({agent.name})가 수행할 작업]\n{instruction}")
@@ -771,8 +778,13 @@ def _build_facilitator_prompt(
     )
     history = _render_history(state, PHASE_COMPLETED, [], force_full=True)
     task = _FACILITATOR_TASKS.get(kind, "지금까지의 진행 상황을 정리하라.")
+    materials = (
+        f"[참고 자료]\n{state.reference_materials}\n\n"
+        if state.reference_materials else ""
+    )
     user = (
         f"[토론 주제]\n{state.topic}\n\n"
+        f"{materials}"
         f"[지금까지의 토론]\n{history or '(아직 발언 없음)'}\n\n"
         f"[사회자 작업]\n{task}"
     )
@@ -890,6 +902,9 @@ def render_transcript(state: DiscussionState) -> str:
     if state.facilitator is not None:
         lines.append(
             f"- 사회자: **{state.facilitator.name}** — {state.facilitator.model}")
+
+    if state.reference_materials:
+        lines += ["", "## 참고 자료", "", state.reference_materials]
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
     if pre:

@@ -116,6 +116,18 @@
       <div id="agentSlots" class="space-y-3"></div>
 
       <div class="flex items-center justify-between mb-1 mt-4">
+        <label class="text-xs font-semibold text-slate-500">참고 자료 (선택)</label>
+        <label class="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-500">
+          <input type="checkbox" id="refToggle" /> 📎 자료 첨부
+        </label>
+      </div>
+      <p class="text-[11px] text-slate-400 mb-2">
+        첨부한 토론에서만 에이전트가 자료를 인용합니다 — 주제에 따라 강제하지 않습니다.</p>
+      <textarea id="refMaterials" rows="4"
+                placeholder="발췌문·요약·URL 목록 등 — 모든 에이전트에게 공통 자료로 주입됩니다"
+                class="hidden w-full mb-2 px-2 py-1.5 text-sm border border-slate-300 rounded"></textarea>
+
+      <div class="flex items-center justify-between mb-1 mt-4">
         <label class="text-xs font-semibold text-slate-500">사회자 (선택)</label>
         <label class="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-500">
           <input type="checkbox" id="facToggle" /> 🎙 사회자 추가
@@ -551,6 +563,8 @@ async function startDiscussion() {
         topic, format_id: $('formatSelect').value,
         force_consensus: $('forceToggle').checked, agents,
         facilitator,
+        reference_materials: ($('refToggle').checked
+          && $('refMaterials').value.trim()) || null,
       }),
     });
     if (!res.ok) throw new Error('토론 생성 실패: ' + res.status + ' ' + (await res.text()));
@@ -1404,6 +1418,17 @@ function renderStateContent(state) {
   hasFacilitator = !!state.facilitator;             // postIntervention 분기
 
   usageTotal = 0;   // 재구성 — 누적 사용량을 0 부터 다시 합산한다
+  // 선택 참고 자료 — 첨부된 토론이면 주제 아래에 접이식 카드로 보여준다.
+  if (state.reference_materials) {
+    const ref = document.createElement('details');
+    ref.className = 'bg-white border border-slate-200 rounded-lg p-3 mb-4 text-sm';
+    ref.innerHTML =
+      '<summary class="cursor-pointer text-xs font-semibold text-slate-500">'
+      + '📎 참고 자료 (에이전트 공통 주입)</summary>'
+      + '<div class="md mt-2 text-slate-800">'
+      + renderMarkdown(state.reference_materials) + '</div>';
+    timelineEl.appendChild(ref);
+  }
   // phase_records 는 단계 인스턴스 키(반복 단계는 'probe#1'…)로, 실행 순서대로
   // 들어 있다 — 가변 길이 형식의 라운드를 그대로 재구성한다.
   Object.values(state.phase_records || {}).forEach((turns) => {
@@ -1653,6 +1678,9 @@ buildFacilitatorSlot();
 $('addSlotBtn').addEventListener('click', () => addAgentSlot());
 $('facToggle').addEventListener('change', () => {
   $('facilitatorSlot').classList.toggle('hidden', !$('facToggle').checked);
+});
+$('refToggle').addEventListener('change', () => {
+  $('refMaterials').classList.toggle('hidden', !$('refToggle').checked);
 });
 $('startBtn').addEventListener('click', startDiscussion);
 $('resetBtn').addEventListener('click', resetDiscussion);

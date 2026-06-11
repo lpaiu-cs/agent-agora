@@ -65,6 +65,33 @@ async def test_targeted_intervention_visible_only_to_target(
     assert "SECRET_알파에게만" not in beta[0], "지향 개입이 다른 에이전트에 누수"
 
 
+async def test_reference_materials_injected_only_when_attached(
+    orchestrator, make_state, patch_llm,
+):
+    """참고 자료 — 첨부 토론의 프롬프트에만 [참고 자료]+인용 규칙이 들어간다."""
+    prompts: list[str] = []
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        prompts.append(user)
+        return "발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(
+        discussion_id="ref",
+        reference_materials="핵심 통계: 응답 지연 200ms 초과 시 이탈률 2배"))
+    await orchestrator.process_event("ref", PipelineEvent.START)
+    agent_prompts = [p for p in prompts if "수행할 작업" in p]
+    assert agent_prompts
+    assert all("[참고 자료]" in p and "응답 지연 200ms" in p
+               and "인용·참조하라" in p for p in agent_prompts)
+
+    # 미첨부 토론 — 자료 섹션이 전혀 없다 (동작 불변).
+    prompts.clear()
+    await database.insert_state(make_state(discussion_id="noref"))
+    await orchestrator.process_event("noref", PipelineEvent.START)
+    assert all("[참고 자료]" not in p for p in prompts)
+
+
 async def test_phase1_manual_copy_has_no_peer_posting(
     orchestrator, make_state, make_agent,
 ):

@@ -13,8 +13,11 @@
 
 - **다중 토론 형식** — 구조화 토론(5단계)·브레인스토밍(4단계)·소크라테스식 문답(가변 길이). 형식마다 단계 구성·프롬프트가 다르며 코드로 추가 가능
 - **가변 길이 형식** — 반복(`repeatable`) 단계가 합의 근접도에 따라 라운드를 거듭한다 (소크라테스식 문답의 문답 라운드)
-- **사회자(facilitator) 에이전트** — 선택적 사회자가 단계 경계에서 개회·중간 조율·폐회로 진행을 조율하고, 가변 길이 형식에서는 반복 라운드 지속 여부까지 판단 (토론자가 아닌 부가 레이어)
-- **멀티 공급자 LLM** — OpenAI · Anthropic · Gemini · DeepSeek · Ollama, 그리고 복붙 기반 `manual` 공급자
+- **사회자(facilitator) 에이전트** — 선택적 사회자가 단계 경계에서 개회·중간 조율·폐회로 진행을 조율하고, 가변 길이 형식에서는 반복 라운드 지속 여부까지 판단. 조율 노트는 참가자 프롬프트에 주입되며, 특정 참가자를 지목해 다음 단계에서 답할 질문을 던질 수 있다(`[지목]`)
+- **지향(target) 개입** — 진행자 H 의 개입을 특정 에이전트에게만 보이게 지정 가능 (기본은 전체)
+- **참고 자료(선택)** — 토론 생성 시 자료를 첨부하면 모든 에이전트에 공통 주입되고 인용 규칙이 활성화된다. 미첨부 시 동작 불변 — 주제에 따라 강제하지 않는다
+- **멀티 공급자 LLM** — OpenAI · Anthropic · Gemini · DeepSeek · Ollama, 그리고 복붙 기반 `manual` 공급자. gpt-5·o-시리즈·deepseek-reasoner 등 reasoning 모델의 파라미터 차이를 자동 흡수
+- **.md 단일 파일 이력** — 저장(`archive`/`export`)된 .md 끝에 복원용 상태 블록이 내장돼, '불러오기' 한 번으로 라이브 UI 그대로 완벽 복원 (구버전 파일은 패턴 파싱 폴백)
 - **토큰 단위 실시간 스트리밍** — WebSocket 으로 발언이 생성되는 과정을 그대로 전송
 - **이벤트 구동형 무상태 오케스트레이션** — 매 이벤트가 `DB 로드 → 전이 → 저장 → 종료`,
   단계 사이·입력 대기 중 메모리 점유 0
@@ -237,9 +240,12 @@ curl -X POST http://127.0.0.1:8000/discussions \
   }'
 ```
 
-- `format_id`(기본 `debate`)·`force_consensus` 는 선택. `agents` 는 **2인 이상** 필수.
+- `format_id`(기본 `debate`)·`force_consensus`·`facilitator`·
+  `reference_materials` 는 선택. `agents` 는 **2인 이상** 필수.
 - `persona_prompt` 는 각 에이전트의 시스템 프롬프트. `temperature`(기본 0.7)·
   `max_tokens`(기본 1024)·`provider`·`persona_type` 는 선택.
+- `POST /discussions/{id}/interventions` 본문의 `target_agent_id`(선택)로
+  특정 에이전트에게만 보이는 지향 개입을 보낼 수 있다.
 
 ### WebSocket 메시지 타입
 

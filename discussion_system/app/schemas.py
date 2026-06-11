@@ -324,6 +324,14 @@ class DiscussionState(BaseModel):
         default=False,
         description="True 시 5단계에서 합의를 강제 (미합의 에이전트도 합의안 수렴 유도)",
     )
+    reference_materials: Optional[str] = Field(
+        default=None,
+        description=(
+            "선택 참고 자료 (텍스트·발췌·URL 목록). 지정 시 모든 에이전트 "
+            "프롬프트에 공통 자료로 주입되고 인용 규칙이 활성화된다. "
+            "None 이면 동작 불변 — 주제에 따라 강제하지 않는다."
+        ),
+    )
 
     # --- 타임스탬프 / 오류 ---
     created_at: datetime = Field(default_factory=_utcnow)
@@ -375,6 +383,10 @@ class CreateDiscussionRequest(BaseModel):
     )
     force_consensus: bool = Field(
         default=False, description="마지막 단계 합의 강제 여부 (형식이 지원할 때만)"
+    )
+    reference_materials: Optional[str] = Field(
+        default=None,
+        description="선택 참고 자료 — 지정 시에만 에이전트가 인용 규칙을 적용한다",
     )
 
 

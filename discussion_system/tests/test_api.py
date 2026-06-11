@@ -43,6 +43,20 @@ def test_create_discussion_with_facilitator(client):
     assert state["facilitator_notes"] == []
 
 
+def test_create_discussion_with_reference_materials(client):
+    r = client.post("/discussions", json={
+        "topic": "자료 기반 토론", "agents": _manual_agents(),
+        "reference_materials": "보고서 발췌: 원격 근무 생산성 +13% (2024)"})
+    assert r.status_code == 201
+    did = r.json()["discussion_id"]
+    state = client.get(f"/discussions/{did}").json()
+    assert "원격 근무 생산성 +13%" in state["reference_materials"]
+    # 미첨부 토론은 None — 옵션이며 강제되지 않는다.
+    did2 = client.post("/discussions", json={
+        "topic": "t", "agents": _manual_agents()}).json()["discussion_id"]
+    assert client.get(f"/discussions/{did2}").json()["reference_materials"] is None
+
+
 def test_create_discussion_rejects_single_agent(client):
     r = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()[:1]})

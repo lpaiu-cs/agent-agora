@@ -38,6 +38,7 @@ _SCALAR_FIELDS = (
     "status",
     "current_phase",
     "force_consensus",
+    "reference_materials",
     "error",
     "final_joint_agreement",
     "created_at",
@@ -58,6 +59,7 @@ class DiscussionRow(Base):
     status = Column(String, nullable=False, index=True)
     current_phase = Column(String, nullable=False)
     force_consensus = Column(Boolean, nullable=False, default=False)
+    reference_materials = Column(Text, nullable=True)   # 선택 참고 자료
     error = Column(Text, nullable=True)
     final_joint_agreement = Column(Text, nullable=True)
     created_at = Column(String, nullable=False)          # ISO-8601 문자열
