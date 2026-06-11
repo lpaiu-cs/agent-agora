@@ -1,10 +1,12 @@
 """토론 형식(DiscussionFormat) 정의 — 단계 구성·프롬프트를 형식별로 캡슐화한다.
 
-기존에는 5단계 토론 프로토콜이 코드 전반에 하드코딩돼 있었다. 이 모듈은 그
-구조를 데이터로 끌어내, 형식마다 단계 개수·순서·지침·순차성을 자유롭게 정의할
-수 있게 한다.
+형식은 코드가 아니라 **JSON 선언**으로 정의된다 — 내장 형식(debate ·
+brainstorm · socratic)은 ``app/format_defs/*.json`` 에, 커스텀 형식은 서버
+작업 디렉터리의 ``formats/*.json``(``AGORA_FORMATS_DIR``)에 둔다. 양쪽 모두
+같은 로더(``format_from_dict``)를 지나므로 스키마·검증이 동일하다.
 
-  * 형식은 코드로 정의된 레지스트리(``FORMATS``)에 등록된다.
+  * 내장 형식은 임포트 시 레지스트리(``FORMATS``)에 적재되고, 커스텀 형식은
+    서버 기동 시 ``load_custom_formats()`` 가 추가한다.
   * ``DiscussionState`` 는 ``format_id`` 만 저장하고, 런타임에 ``get_format`` 으로
     형식을 조회한다.
   * 단계(phase)는 형식 안에서 문자열 id 로 식별된다 (``"opinion"``, ``"diverge"``…).
@@ -14,7 +16,11 @@
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 #: 토론 시작 전 / 종료 후를 나타내는 예약 단계 식별자 (실제 단계 아님).
@@ -142,214 +148,143 @@ def phase_key(spec: PhaseSpec, round_no: int) -> str:
 
 
 # ===========================================================================
-# 공통 규칙
+# 형식 로더 — 내장·커스텀 형식을 동일한 JSON 선언으로 정의한다
 # ===========================================================================
-_DEBATE_RULES = (
-    "너는 '{topic}' 주제의 다자(多者) 구조화 토론에 참여하는 토론자다.\n"
-    "토론은 5단계(① 초기주장 → ② 상호비판 → ③ 반론·방어 → ④ 입장수정 "
-    "→ ⑤ 최종결론)로 진행된다.\n"
-    "[공통 규칙]\n"
-    "- 한국어로, 핵심 위주로 간결하게(6~8문장 이내) 작성한다.\n"
-    "- 다른 참가자를 이름으로 직접 지칭하며 구체적으로 논평한다.\n"
-    "- '참가자 H' 로 표기된 발언은 토론을 지켜보는 인간 진행자의 개입이다. "
-    "그 지시는 최우선으로 반영한다.\n"
-    "- '[시스템 경고: ...]' 로 표기된 발언은 해당 에이전트의 응답 생성 실패를 "
-    "뜻한다. 그 내용에 의존하거나 인용하지 말고 토론을 정상 진행한다."
-)
+#: 내장 형식 JSON 정의 디렉터리 (debate.json · brainstorm.json · socratic.json).
+_BUILTIN_DEFS_DIR = Path(__file__).resolve().parent / "format_defs"
 
-_BRAINSTORM_RULES = (
-    "너는 '{topic}' 주제의 다자(多者) 브레인스토밍 세션에 참여하는 참여자다.\n"
-    "세션은 4단계(① 아이디어 발산 → ② 상호 확장 → ③ 수렴·선별 → ④ 실행안)로 "
-    "진행된다.\n"
-    "[공통 규칙]\n"
-    "- 한국어로, 핵심 위주로 간결하게(6~8문장 이내) 작성한다.\n"
-    "- 비판보다 발전에 무게를 둔다 — 남의 아이디어를 깎아내리기보다 키운다.\n"
-    "- 다른 참가자를 이름으로 직접 지칭하며 구체적으로 반응한다.\n"
-    "- '참가자 H' 로 표기된 발언은 세션을 지켜보는 인간 진행자의 개입이다. "
-    "그 지시는 최우선으로 반영한다.\n"
-    "- '[시스템 경고: ...]' 로 표기된 발언은 해당 에이전트의 응답 생성 실패를 "
-    "뜻한다. 그 내용에 의존하거나 인용하지 말고 세션을 정상 진행한다."
-)
+#: 커스텀 형식 디렉터리 — 서버 작업 디렉터리 기준 상대 경로 (환경변수로 변경).
+CUSTOM_FORMATS_DIR_ENV = "AGORA_FORMATS_DIR"
+DEFAULT_CUSTOM_FORMATS_DIR = "formats"
 
-_SOCRATIC_RULES = (
-    "너는 '{topic}' 주제를 놓고 벌이는 소크라테스식 문답 토론의 참여자다.\n"
-    "토론은 입장 제시 → 문답 라운드(반복) → 종합 순으로 진행되며, 문답 라운드는 "
-    "논의가 충분히 수렴할 때까지 여러 번 반복된다.\n"
-    "[공통 규칙]\n"
-    "- 한국어로, 핵심 위주로 간결하게(6~8문장 이내) 작성한다.\n"
-    "- 단정하기보다 질문한다 — 상대 주장의 숨은 전제를 캐묻고, 받은 질문에는 "
-    "회피 없이 성실히 답한다.\n"
-    "- 다른 참가자를 이름으로 직접 지칭하며 구체적으로 묻고 답한다.\n"
-    "- '참가자 H' 로 표기된 발언은 토론을 지켜보는 인간 진행자의 개입이다. "
-    "그 지시는 최우선으로 반영한다.\n"
-    "- '[시스템 경고: ...]' 로 표기된 발언은 해당 에이전트의 응답 생성 실패를 "
-    "뜻한다. 그 내용에 의존하거나 인용하지 말고 토론을 정상 진행한다."
-)
+logger = logging.getLogger(__name__)
 
 
-# ===========================================================================
-# 형식 정의
-# ===========================================================================
-#: 구조화 토론 — 기존 5단계 프로토콜. 단계 지침은 종전과 동일(동작 불변).
-DEBATE = DiscussionFormat(
-    id="debate",
-    name="구조화 토론",
-    description="찬반·쟁점 중심의 5단계 토론 — 초기주장부터 최종결론까지.",
-    common_rules=_DEBATE_RULES,
-    supports_consensus=True,
-    phases=(
-        PhaseSpec(
-            id="opinion",
-            label="1단계 · 초기주장",
-            instruction=(
-                "[1단계 · 초기주장] 주제에 대한 너의 입장과 이를 뒷받침하는 핵심 "
-                "논거 2~3가지를 명확히 제시하라."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="critique",
-            label="2단계 · 상호비판",
-            instruction=(
-                "[2단계 · 상호비판] 다른 참가자들의 주장에서 가장 약한 지점을 찾아 "
-                "근거를 들어 비판적으로 검토하라."
-            ),
-            sequential=True,
-        ),
-        PhaseSpec(
-            id="rebuttal",
-            label="3단계 · 반론·방어",
-            instruction=(
-                "[3단계 · 반론·방어] 너의 주장에 제기된 비판을 직접 거론하며 "
-                "반론하고, 필요하면 논거를 보강해 입장을 방어하라."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="revision",
-            label="4단계 · 입장수정",
-            instruction=(
-                "[4단계 · 입장수정] 지금까지의 토론을 반영하여 너의 입장을 "
-                "갱신하라. 바뀐 부분과 그대로 유지하는 부분을 구분해 밝혀라."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="conclusion",
-            label="5단계 · 최종결론",
-            instruction=(
-                "[5단계 · 최종결론] 다른 참가자들의 4단계 입장을 검토하고, 너의 "
-                "최종 입장과 끝내 좁혀지지 않은 핵심 차이점을 '이견 일람표'(쟁점 | "
-                "나의 입장 | 상대 입장 형식의 표)로 정리하라."
-            ),
-            sequential=False,
-        ),
-    ),
-)
+def format_from_dict(data: dict) -> DiscussionFormat:
+    """JSON 선언(dict)을 검증해 DiscussionFormat 으로 만든다.
 
-#: 브레인스토밍 — 발산에서 실행안까지 4단계. 비판보다 발전 지향.
-BRAINSTORM = DiscussionFormat(
-    id="brainstorm",
-    name="브레인스토밍",
-    description="아이디어 발산부터 실행안까지 — 발산·확장·수렴·실행 4단계.",
-    common_rules=_BRAINSTORM_RULES,
-    supports_consensus=False,
-    phases=(
-        PhaseSpec(
-            id="diverge",
-            label="1단계 · 아이디어 발산",
-            instruction=(
-                "[1단계 · 아이디어 발산] 주제에 대해 제약을 두지 말고 새로운 "
-                "아이디어를 2~3개 제시하라. 실현 가능성보다 발상의 폭과 참신함을 "
-                "우선한다."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="expand",
-            label="2단계 · 상호 확장",
-            instruction=(
-                "[2단계 · 상호 확장] 다른 참가자들의 아이디어 중 가장 유망한 것을 "
-                "골라, '예, 그리고'의 태도로 살을 붙여 더 구체적이고 강한 형태로 "
-                "발전시켜라."
-            ),
-            sequential=True,
-        ),
-        PhaseSpec(
-            id="converge",
-            label="3단계 · 수렴·선별",
-            instruction=(
-                "[3단계 · 수렴·선별] 지금까지 나온 아이디어들을 평가해, 가장 가치 "
-                "있다고 판단하는 1~2개를 선별하고 그 선정 근거를 밝혀라."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="action",
-            label="4단계 · 실행안",
-            instruction=(
-                "[4단계 · 실행안] 선별된 아이디어를 실제로 추진하기 위한 구체적인 "
-                "다음 단계와 예상되는 제약·위험을 제시하라."
-            ),
-            sequential=False,
-        ),
-    ),
-)
+    내장 형식과 커스텀 형식이 같은 경로를 지난다 — 검증 실패는 한국어
+    ``ValueError`` 로 즉시 알린다 (호출부가 파일 단위로 흡수).
+    """
+    for key in ("id", "name", "description", "common_rules", "phases"):
+        if not data.get(key):
+            raise ValueError(f"필수 필드 누락 또는 빈 값: {key}")
+    common_rules = str(data["common_rules"])
+    try:
+        common_rules.format(topic="검증용 주제")
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(
+            "common_rules 는 str.format 으로 {topic} 을 채울 수 있어야 한다 — "
+            f"중괄호 문법 오류: {exc!r}"
+        ) from None
+    phases = data["phases"]
+    if not isinstance(phases, list) or not phases:
+        raise ValueError("phases 는 1개 이상의 단계 목록이어야 한다")
+    specs: list[PhaseSpec] = []
+    seen: set[str] = set()
+    for i, p in enumerate(phases):
+        if not isinstance(p, dict):
+            raise ValueError(f"phases[{i}] 는 객체여야 한다")
+        for key in ("id", "label", "instruction"):
+            if not p.get(key):
+                raise ValueError(f"phases[{i}] 필수 필드 누락 또는 빈 값: {key}")
+        pid = str(p["id"])
+        if ROUND_SEP in pid:
+            raise ValueError(
+                f"단계 id '{pid}' — '{ROUND_SEP}' 는 라운드 구분자로 예약됨")
+        if pid in (PHASE_IDLE, PHASE_COMPLETED):
+            raise ValueError(f"단계 id '{pid}' 는 수명주기 표식으로 예약됨")
+        if pid in seen:
+            raise ValueError(f"중복 단계 id: {pid}")
+        seen.add(pid)
+        min_rounds = int(p.get("min_rounds", 1))
+        max_rounds = int(p.get("max_rounds", 1))
+        repeatable = bool(p.get("repeatable", False))
+        if repeatable and not (1 <= min_rounds <= max_rounds):
+            raise ValueError(
+                f"단계 '{pid}': 1 <= min_rounds <= max_rounds 여야 한다 "
+                f"(min={min_rounds}, max={max_rounds})")
+        specs.append(PhaseSpec(
+            id=pid,
+            label=str(p["label"]),
+            instruction=str(p["instruction"]),
+            sequential=bool(p.get("sequential", False)),
+            repeatable=repeatable,
+            min_rounds=min_rounds,
+            max_rounds=max_rounds,
+            converge_threshold=float(p.get("converge_threshold", 1.0)),
+        ))
+    return DiscussionFormat(
+        id=str(data["id"]),
+        name=str(data["name"]),
+        description=str(data["description"]),
+        common_rules=common_rules,
+        phases=tuple(specs),
+        supports_consensus=bool(data.get("supports_consensus", False)),
+    )
 
 
-#: 소크라테스식 문답 — 가변 길이 형식. 문답 라운드(probe)가 합의 근접도에 따라
-#: 2~6회 반복된다 — 총 단계 수가 런타임에 결정되는 첫 형식이다.
-SOCRATIC = DiscussionFormat(
-    id="socratic",
-    name="소크라테스식 문답",
-    description=(
-        "입장 제시 후 문답 라운드를 합의에 가까워질 때까지 반복하는 가변 길이 토론."
-    ),
-    common_rules=_SOCRATIC_RULES,
-    supports_consensus=True,
-    phases=(
-        PhaseSpec(
-            id="position",
-            label="입장 제시",
-            instruction=(
-                "[입장 제시] 주제에 대한 너의 입장과 그 입장이 기대고 있는 핵심 "
-                "전제 1~2가지를 명확히 밝혀라."
-            ),
-            sequential=False,
-        ),
-        PhaseSpec(
-            id="probe",
-            label="문답 라운드",
-            instruction=(
-                "[문답 라운드] 다른 참가자의 입장에서 가장 검증이 필요한 전제를 "
-                "하나 골라 날카롭게 질문하라. 동시에 네가 받은 질문에는 회피 없이 "
-                "답하고, 설득력 있는 지적은 너의 입장에 반영하라."
-            ),
-            sequential=True,
-            repeatable=True,
-            min_rounds=2,
-            max_rounds=6,
-            converge_threshold=0.8,
-        ),
-        PhaseSpec(
-            id="synthesis",
-            label="종합",
-            instruction=(
-                "[종합] 문답을 거치며 도달한 너의 최종 입장을 정리하고, 합의된 "
-                "지점과 끝내 남은 이견을 구분해 밝혀라."
-            ),
-            sequential=False,
-        ),
-    ),
-)
+def _load_format_file(path: Path) -> DiscussionFormat:
+    """JSON 파일 1개를 읽어 형식으로 만든다 (형식 오류는 ValueError)."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("형식 정의는 최상위 JSON 객체여야 한다")
+    return format_from_dict(data)
 
 
-#: 형식 레지스트리 — id -> DiscussionFormat.
-FORMATS: dict[str, DiscussionFormat] = {
-    DEBATE.id: DEBATE,
-    BRAINSTORM.id: BRAINSTORM,
-    SOCRATIC.id: SOCRATIC,
-}
+def _load_builtin_formats() -> dict[str, DiscussionFormat]:
+    """내장 형식(JSON 정의)을 적재한다 — 실패는 앱 결함이므로 즉시 전파."""
+    registry: dict[str, DiscussionFormat] = {}
+    for path in sorted(_BUILTIN_DEFS_DIR.glob("*.json")):
+        fmt = _load_format_file(path)
+        registry[fmt.id] = fmt
+    if DEFAULT_FORMAT_ID not in registry:
+        raise RuntimeError(
+            f"내장 형식 '{DEFAULT_FORMAT_ID}' 가 없다 — format_defs/ 손상")
+    return registry
+
+
+def load_custom_formats(directory: Optional[str] = None) -> list[str]:
+    """커스텀 형식 디렉터리의 *.json 을 레지스트리에 추가한다.
+
+    서버 기동 시(lifespan) 호출된다. 디렉터리가 없으면 조용히 건너뛰고,
+    불량 파일은 경고 로그 후 스킵하며, 내장 형식 id 와 충돌하는 정의는
+    거부한다 — 커스텀이 내장 동작을 바꿔치기하지 못하게. 등록된 형식 id
+    목록을 반환한다.
+    """
+    directory = directory or os.getenv(
+        CUSTOM_FORMATS_DIR_ENV, DEFAULT_CUSTOM_FORMATS_DIR)
+    base = Path(directory)
+    if not base.is_dir():
+        return []
+    builtin_ids = set(_BUILTIN_IDS)
+    loaded: list[str] = []
+    for path in sorted(base.glob("*.json")):
+        try:
+            fmt = _load_format_file(path)
+        except Exception as exc:  # noqa: BLE001 - 불량 파일은 형식 단위로 스킵
+            logger.warning("커스텀 형식 적재 실패(%s): %s", path.name, exc)
+            continue
+        if fmt.id in builtin_ids:
+            logger.warning(
+                "커스텀 형식 '%s'(%s) — 내장 형식 id 와 충돌, 거부", fmt.id, path.name)
+            continue
+        FORMATS[fmt.id] = fmt
+        loaded.append(fmt.id)
+        logger.info("커스텀 형식 등록: %s (%s)", fmt.id, path.name)
+    return loaded
+
+
+#: 형식 레지스트리 — id -> DiscussionFormat. 내장은 임포트 시, 커스텀은
+#: 서버 기동 시(load_custom_formats) 추가된다.
+FORMATS: dict[str, DiscussionFormat] = _load_builtin_formats()
+_BUILTIN_IDS: tuple[str, ...] = tuple(FORMATS)
+
+#: 내장 형식 별칭 — 기존 코드·테스트 호환.
+DEBATE = FORMATS["debate"]
+BRAINSTORM = FORMATS["brainstorm"]
+SOCRATIC = FORMATS["socratic"]
 
 
 def get_format(format_id: str) -> DiscussionFormat:

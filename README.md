@@ -70,6 +70,40 @@
 반복 단계는 `PhaseSpec(repeatable=True, min_rounds, max_rounds, converge_threshold)`
 로 정의하며, 단계 진행은 `formats.plan_next()` 가 합의 근접도를 보고 결정한다.
 
+### 커스텀 형식 빌더 (JSON)
+
+형식은 코드가 아니라 **JSON 선언**으로 정의된다 — 내장 형식 3종도 같은 스키마의
+`app/format_defs/*.json` 으로 존재한다. 서버 작업 디렉터리에 `formats/` 폴더
+(`AGORA_FORMATS_DIR` 로 변경 가능)를 만들고 `*.json` 을 넣으면 **코드 수정 없이**
+기동 시 자동 등록되어 UI 형식 드롭다운에 나타난다.
+
+```json
+{
+  "id": "roundtable",
+  "name": "원탁 자유 토론",
+  "description": "발언 라운드를 수렴할 때까지 반복하는 자유 토론.",
+  "supports_consensus": true,
+  "common_rules": "너는 '{topic}' 원탁 토론의 참여자다.\n[공통 규칙]\n- 한국어로 간결하게 작성한다.",
+  "phases": [
+    {"id": "talk", "label": "자유 발언 라운드",
+     "instruction": "[자유 발언] 앞 발언들을 딛고 너의 의견을 전개하라.",
+     "sequential": true, "repeatable": true,
+     "min_rounds": 1, "max_rounds": 5, "converge_threshold": 0.75},
+    {"id": "wrap", "label": "정리",
+     "instruction": "[정리] 합의점과 남은 이견을 구분해 결론을 내라."}
+  ]
+}
+```
+
+- 필수: `id`·`name`·`description`·`common_rules`·`phases`(1개 이상, 각 단계는
+  `id`·`label`·`instruction` 필수). `common_rules` 의 `{topic}` 자리에 주제가
+  치환된다.
+- 선택(단계별): `sequential`(기본 false), `repeatable`·`min_rounds`·`max_rounds`·
+  `converge_threshold`(가변 길이), 형식 레벨 `supports_consensus`(기본 false).
+- 단계 `id` 에 `#` 금지(라운드 구분자), `idle`/`completed` 는 예약어.
+- 불량 파일은 경고 로그 후 건너뛰고, 내장 형식 id(`debate` 등)와 충돌하는
+  정의는 거부된다 — 서버는 항상 정상 기동한다.
+
 **동시** 단계는 `asyncio.gather` 병렬 호출이며 서로의 발제를 보지 않는다.
 **순차** 단계만 후순위 에이전트가 같은 단계 선행 의견을 맥락으로 받는다. 각 단계가
 끝나면 파이프라인이 게이트 락(`waiting_for_user`)되어 유저 개입을 기다린다.
@@ -108,7 +142,8 @@ agent-agora/
     │   ├── __init__.py       # 버전 상수
     │   ├── main.py           # FastAPI 진입점 (lifespan: DB·풀 초기화/정리)
     │   ├── schemas.py        # Pydantic v2 데이터 모델 (상태·요청·WS 메시지)
-    │   ├── formats.py        # 토론 형식 정의·진행 결정 (debate · brainstorm · socratic)
+    │   ├── formats.py        # 형식 JSON 로더·검증·진행 결정 (내장+커스텀 공용)
+    │   ├── format_defs/      # 내장 형식 JSON 선언 (debate · brainstorm · socratic)
     │   ├── manager.py        # 이벤트 구동형 무상태 Orchestrator + LLM 연동
     │   ├── database.py       # 비동기 영속성 레이어 (저장/조회 + 낙관적 락)
     │   ├── models.py         # SQLAlchemy ORM 모델 + 상태 <-> 행 변환

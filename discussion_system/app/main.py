@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from . import __version__, database
+from .formats import load_custom_formats
 from .manager import LLMClientPool, Orchestrator
 from .routers import discussion
 from .routers.discussion import SocketRegistry
@@ -40,6 +41,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     변수와 임포트 순서에 의존하지 않는다.
     """
     await database.init_db()
+
+    # 커스텀 토론 형식 적재 — formats/(AGORA_FORMATS_DIR) 의 *.json.
+    custom = load_custom_formats()
+    if custom:
+        logger.info("커스텀 토론 형식 %d개 등록: %s", len(custom), custom)
 
     sockets = SocketRegistry()
     pool = LLMClientPool()
