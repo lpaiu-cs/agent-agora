@@ -175,6 +175,49 @@ async def test_h_intervention_no_facilitator_skips_regen(
     assert len(st.user_interventions) == 1    # 개입은 정상 기록
 
 
+async def test_facilitator_note_and_targeted_question_reach_agent_prompts(
+    orchestrator, make_state, make_agent, patch_llm,
+):
+    """사회자 between 노트가 다음 단계 프롬프트에 주입되고, [지목] 질문은
+    지목된 에이전트에게만 들어간다."""
+    prompts: list[str] = []
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        if "사회자 작업" in user:
+            return ("다음 단계는 비용 쟁점에 집중하라.\n"
+                    "[지목] 알파: 누수 임계값을 숫자로 제시하라")
+        if "convergence_score" in user:
+            return json.dumps({"agent_summaries": [], "key_conflicts": [],
+                               "convergence_score": 0.5})
+        prompts.append(user)
+        return "에이전트 발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(
+        discussion_id="tq", facilitator=make_agent("f1", "사회자")))
+
+    await orchestrator.process_event("tq", PipelineEvent.START)
+    st = await database.load_state("tq")
+    assert st.status is DiscussionStatus.WAITING_FOR_USER
+    # between 노트에 지목이 파싱돼 저장됐다.
+    between = [n for n in st.facilitator_notes if n.kind == "between"]
+    assert between[0].metadata.get("targets") == {
+        "알파": "누수 임계값을 숫자로 제시하라"}
+
+    prompts.clear()
+    await orchestrator.process_event("tq", PipelineEvent.ADVANCE)   # 2단계 진행
+
+    alpha = [p for p in prompts if "너(알파)가 수행할 작업" in p]
+    beta = [p for p in prompts if "너(베타)가 수행할 작업" in p]
+    assert alpha and beta
+    # 사회자 진행 노트는 두 에이전트 모두의 맥락에 보인다.
+    assert all("비용 쟁점에 집중하라" in p for p in alpha + beta)
+    # 지목 질문은 알파에게만.
+    assert "[사회자가 너(알파)를 지목한 질문]" in alpha[0]
+    assert "누수 임계값" in alpha[0]
+    assert "지목한 질문" not in beta[0]
+
+
 # ---------------------------------------------------------------------------
 # 증분 C — 사회자 'decision' 훅이 가변 길이(반복 단계) 루프를 구동한다
 # ---------------------------------------------------------------------------

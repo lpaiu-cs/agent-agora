@@ -4,7 +4,9 @@ import pytest
 from app import manager
 from app.manager import (
     _convergence_from_summary,
+    _intervention_lines,
     _llm_agent,
+    _parse_facilitator_targets,
     _positive_int_env,
     _render_convergence_trajectory,
     _split_reasoning_draft,
@@ -19,6 +21,7 @@ from app.schemas import (
     FacilitatorNote,
     ModelProvider,
     PhaseSummary,
+    UserIntervention,
 )
 
 
@@ -107,6 +110,36 @@ def test_render_convergence_trajectory():
     assert "45%" in out and "60%" in out
     # opinion(45%)이 critique(60%)보다 먼저 나온다 — 실행 순서.
     assert out.index("45%") < out.index("60%")
+
+
+# ---------------------------------------------------------------------------
+# 지향 개입 / 사회자 지목 질문 — 순수 헬퍼
+# ---------------------------------------------------------------------------
+def test_intervention_lines_respect_target():
+    state = _state(ModelProvider.OPENAI, ModelProvider.OPENAI)   # a0, a1
+    ivs = [
+        UserIntervention(message="전체 공지"),
+        UserIntervention(message="a0 비밀 지시", target_agent_id="a0"),
+    ]
+    # a0 시점 — 전체 공지 + 자기 지향('너에게') 둘 다.
+    a0 = _intervention_lines(state, ivs, "a0")
+    assert a0 == ["[참가자 H] 전체 공지", "[참가자 H → 너에게] a0 비밀 지시"]
+    # a1 시점 — 남에게 지향된 개입은 숨겨진다.
+    assert _intervention_lines(state, ivs, "a1") == ["[참가자 H] 전체 공지"]
+    # 전체 시점(None) — 대상 이름 표기와 함께 모두 보인다.
+    all_view = _intervention_lines(state, ivs, None)
+    assert "[참가자 H → a0] a0 비밀 지시" in all_view
+
+
+def test_parse_facilitator_targets():
+    text = ("다음 단계의 초점은 비용 검증이다.\n"
+            "[지목] 알파: 누수 임계값을 숫자로 제시하라\n"
+            "[지목] 베타: decay 상수의 근거는?\n"
+            "맺음말.")
+    targets = _parse_facilitator_targets(text)
+    assert targets == {"알파": "누수 임계값을 숫자로 제시하라",
+                       "베타": "decay 상수의 근거는?"}
+    assert _parse_facilitator_targets("지목 없는 코멘트") == {}
 
 
 # ---------------------------------------------------------------------------

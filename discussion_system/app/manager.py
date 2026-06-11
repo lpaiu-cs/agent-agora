@@ -543,27 +543,57 @@ def _render_phase_summary(
     return "\n".join(lines)
 
 
+def _intervention_lines(
+    state: DiscussionState,
+    interventions: list[UserIntervention],
+    reader_id: Optional[str],
+) -> list[str]:
+    """개입 목록을 프롬프트 라인으로 — 지향(target) 개입은 대상에게만 보인다.
+
+    ``reader_id=None``(사회자·합의 합성 등 전체 시점)이면 모든 개입을 대상
+    표기와 함께 보여 주고, 특정 에이전트 시점이면 남에게 지향된 개입은 그
+    에이전트의 맥락에서 제외한다.
+    """
+    name_of = {a.agent_id: a.name for a in state.agents}
+    lines: list[str] = []
+    for iv in interventions:
+        target = iv.target_agent_id
+        if not target:
+            lines.append(f"[참가자 H] {iv.message}")
+        elif reader_id is None:
+            tname = name_of.get(target, target)
+            lines.append(f"[참가자 H → {tname}] {iv.message}")
+        elif target == reader_id:
+            lines.append(f"[참가자 H → 너에게] {iv.message}")
+    return lines
+
+
 def _render_history(
     state: DiscussionState,
     current_key: str,
     prior_turns: list[AgentTurn],
     force_full: bool = False,
+    reader_id: Optional[str] = None,
 ) -> str:
     """이전 단계 인스턴스 발언 + 유저 개입 + (순차) 선행 의견을 렌더링한다.
 
     가변 길이 형식에서는 단계 인스턴스(반복 단계의 라운드 포함)를 실행 순서대로
     펼친다. 콘텍스트 압축(LTM): 최근 2개 인스턴스를 제외한 더 오래된 것은 원본
     로그 대신 ``phase_summaries`` 요약을 경량 주입한다. ``force_full=True`` 이면
-    압축을 끈다.
+    압축을 끈다. ``reader_id`` 가 있으면 그 에이전트 시점으로 — 남에게 지향된
+    개입은 숨긴다. 사회자 진행 노트(개회·중간 조율)도 해당 단계 자리에 주입돼
+    참가자들이 사회자의 조율을 실제로 보게 된다.
     """
     name_of = {a.agent_id: a.name for a in state.agents}
     summary_of = {s.phase: s for s in state.phase_summaries}
     lines: list[str] = []
 
-    pre = [iv for iv in state.user_interventions if iv.after_phase is None]
-    if pre:
+    pre_lines = _intervention_lines(
+        state, [iv for iv in state.user_interventions if iv.after_phase is None],
+        reader_id)
+    if pre_lines:
         lines.append("== 진행자 사전 지시 ==")
-        lines.extend(f"[참가자 H] {iv.message}" for iv in pre)
+        lines.extend(pre_lines)
 
     # 현재 인스턴스 직전까지가 '과거' — 현재 라운드 동석 발언은 prior_turns 로 받는다.
     past: list[tuple[PhaseSpec, int, str]] = []
@@ -584,10 +614,24 @@ def _render_history(
                 for turn in turns:
                     speaker = name_of.get(turn.agent_id, turn.agent_id)
                     lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions if iv.after_phase == key]
-        if after:
+        after_lines = _intervention_lines(
+            state, [iv for iv in state.user_interventions
+                    if iv.after_phase == key], reader_id)
+        if after_lines:
             lines.append(f"-- {label} 이후 진행자 개입 --")
-            lines.extend(f"[참가자 H] {iv.message}" for iv in after)
+            lines.extend(after_lines)
+        notes = [n for n in state.facilitator_notes
+                 if n.phase == key and n.kind in ("open", "between")]
+        if notes:
+            lines.append(f"-- 사회자 진행 노트 ({label}) --")
+            lines.extend(f"[사회자] {n.content}" for n in notes)
+
+    # 현재 단계에 붙은 개회 노트 — 첫 단계를 여는 사회자 안내.
+    opening = [n for n in state.facilitator_notes
+               if n.phase == current_key and n.kind == "open"]
+    if opening:
+        lines.append("-- 사회자 개회 안내 --")
+        lines.extend(f"[사회자] {n.content}" for n in opening)
 
     if prior_turns:
         lines.append("== 이번 단계 선행 의견 ==")
@@ -601,6 +645,7 @@ def _render_delta(
     state: DiscussionState,
     current_key: str,
     prior_turns: list[AgentTurn],
+    reader_id: Optional[str] = None,
 ) -> str:
     """직전 단계 인스턴스 발언 + 그 직후 진행자 개입 + (순차) 이번 선행 의견만."""
     name_of = {a.agent_id: a.name for a in state.agents}
@@ -624,10 +669,17 @@ def _render_delta(
             for turn in turns:
                 speaker = name_of.get(turn.agent_id, turn.agent_id)
                 lines.append(f"[{speaker}] {turn.content}")
-        after = [iv for iv in state.user_interventions if iv.after_phase == key]
-        if after:
+        after_lines = _intervention_lines(
+            state, [iv for iv in state.user_interventions
+                    if iv.after_phase == key], reader_id)
+        if after_lines:
             lines.append("-- 직후 진행자 개입 --")
-            lines.extend(f"[참가자 H] {iv.message}" for iv in after)
+            lines.extend(after_lines)
+        notes = [n for n in state.facilitator_notes
+                 if n.phase == key and n.kind in ("open", "between")]
+        if notes:
+            lines.append("-- 사회자 진행 노트 --")
+            lines.extend(f"[사회자] {n.content}" for n in notes)
     if prior_turns:
         lines.append("== 이번 단계 선행 의견 ==")
         for turn in prior_turns:
@@ -661,7 +713,15 @@ def _build_prompt(
         )
     if spec and spec.sequential and prior_turns:
         instruction = f"{instruction}\n\n{_SEQUENTIAL_REVISION_HINT}"
-    history = _render_history(state, phase, prior_turns, force_full=force_full)
+    # 사회자가 직전 게이트에서 이 에이전트를 지목한 질문 — 반드시 답하게 한다.
+    fac_question = _facilitator_question_for(state, agent)
+    if fac_question:
+        instruction += (
+            f"\n\n[사회자가 너({agent.name})를 지목한 질문]\n{fac_question}\n"
+            "이번 발언에서 이 질문에 반드시 답하라."
+        )
+    history = _render_history(state, phase, prior_turns,
+                              force_full=force_full, reader_id=agent.agent_id)
     user_sections = [f"[토론 주제]\n{state.topic}"]
     if history:
         user_sections.append(history)
@@ -677,7 +737,9 @@ _FACILITATOR_TASKS: dict[str, str] = {
     ),
     "between": (
         "방금 끝난 단계를 짚어라. 아직 풀리지 않은 가장 첨예한 쟁점 하나를 "
-        "골라, 다음 단계의 초점을 2~3문장으로 제시하라."
+        "골라, 다음 단계의 초점을 2~3문장으로 제시하라. 특정 참가자가 다음 "
+        "단계에서 꼭 답해야 할 질문이 있으면, 각 지목을 별도 줄에 정확히 "
+        "'[지목] 참가자이름: 질문' 형식으로 덧붙여라 (최대 2개, 없으면 생략)."
     ),
     "close": (
         "토론 전체를 마무리한다. 합의된 지점과 끝내 갈린 지점을 구분해 "
@@ -723,6 +785,32 @@ def _parse_facilitator_decision(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _parse_facilitator_targets(text: str) -> dict[str, str]:
+    """사회자 응답의 '[지목] 이름: 질문' 줄들을 {이름: 질문} 으로 추출한다."""
+    out: dict[str, str] = {}
+    for m in re.finditer(r"^\[지목\]\s*(.+?)\s*[:：]\s*(.+)$", text, re.MULTILINE):
+        name, question = m.group(1).strip(), m.group(2).strip()
+        if name and question:
+            out[name] = question
+    return out
+
+
+def _facilitator_question_for(
+    state: DiscussionState, agent: AgentConfig
+) -> Optional[str]:
+    """직전 게이트의 사회자 지목 질문 중 이 에이전트 몫을 반환한다.
+
+    노트는 시간순으로 누적되므로, 가장 최근 between 노트가 곧 현재 단계를
+    여는 조율이다 — 그 노트의 지목만 본다 (옛 지목이 계속 따라붙지 않게).
+    """
+    for note in reversed(state.facilitator_notes):
+        if note.kind == "between":
+            targets = (note.metadata or {}).get("targets") or {}
+            question = targets.get(agent.name)
+            return str(question) if question else None
+    return None
+
+
 def generate_deep_copy(
     state: DiscussionState,
     agent_id: str,
@@ -753,10 +841,16 @@ def generate_general_copy(
     agent = _agent_by_id(state, agent_id)
     prior = list(prior_turns or [])
     spec = _format_of(state).phase(phase)
-    delta = _render_delta(state, phase, prior)
+    delta = _render_delta(state, phase, prior, reader_id=agent_id)
     instruction = spec.instruction if spec else f"[{phase}] 단계 작업을 수행하라."
     if spec and spec.sequential and prior:
         instruction = f"{instruction}\n\n{_SEQUENTIAL_REVISION_HINT}"
+    fac_question = _facilitator_question_for(state, agent)
+    if fac_question:
+        instruction += (
+            f"\n\n[사회자가 너({agent.name})를 지목한 질문]\n{fac_question}\n"
+            "이번 발언에서 이 질문에 반드시 답하라."
+        )
     sections = ["[복사 유형] 일반 복사 — 진행 중인 대화 세션에 이어 붙이세요."]
     if delta:
         sections.append(delta)
@@ -824,7 +918,11 @@ def render_transcript(state: DiscussionState) -> str:
                     f"_주요 쟁점: {' · '.join(summary.key_conflicts)}_")
         for iv in state.user_interventions:
             if iv.after_phase == key:
-                lines.append(f"> 진행자 개입: {iv.message}")
+                target = ""
+                if iv.target_agent_id:
+                    tname = name_of.get(iv.target_agent_id, iv.target_agent_id)
+                    target = f" (→ {tname})"
+                lines.append(f"> 진행자 개입{target}: {iv.message}")
         for note in state.facilitator_notes:
             if note.phase == key and note.kind in ("between", "decision"):
                 tag = "진행 결정" if note.kind == "decision" else "중간 조율"
@@ -1571,6 +1669,10 @@ class Orchestrator:
         meta: dict = {"usage": usage}
         if failed:
             meta["failed"] = True
+        if kind == "between" and not failed:
+            targets = _parse_facilitator_targets(content)
+            if targets:
+                meta["targets"] = targets   # 다음 단계 프롬프트의 지목 질문
         note = FacilitatorNote(
             phase=phase, kind=kind, content=content, decision=decision,
             metadata=meta)

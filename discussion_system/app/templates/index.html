@@ -161,6 +161,13 @@
         <div id="interventionLabel" class="text-xs font-bold text-amber-600 mb-2">
           ⏸ 단계 종료 — 유저 개입 대기 중
         </div>
+        <div class="flex items-center gap-2 mb-1">
+          <label class="text-[11px] text-slate-500">대상</label>
+          <select id="interventionTarget"
+                  class="text-xs px-2 py-1 border border-slate-300 rounded">
+            <option value="">전체 (모든 에이전트)</option>
+          </select>
+        </div>
         <textarea id="interventionInput" rows="2"
                   placeholder="참가자 H로서 토론에 개입할 내용을 입력하세요…"
                   class="w-full mb-2 px-2 py-1.5 text-sm border border-slate-300 rounded"></textarea>
@@ -1060,8 +1067,14 @@ function renderIntervention(iv) {
   if (!iv) return;
   const div = document.createElement('div');
   div.className = 'bubble--hint rounded-lg p-3 my-2';
+  // 지향 개입 — 대상 에이전트 이름을 표기한다 (그 에이전트에게만 보였음).
+  let title = '🙋 참가자 H 개입';
+  if (iv.target_agent_id) {
+    const tname = (agentsById[iv.target_agent_id] || {}).name || iv.target_agent_id;
+    title += ' → ' + escapeHtml(tname);
+  }
   div.innerHTML =
-    `<div class="text-xs font-bold text-amber-700 mb-1">🙋 참가자 H 개입</div>`
+    `<div class="text-xs font-bold text-amber-700 mb-1">${title}</div>`
     + `<div class="text-sm text-slate-800 md">${renderMarkdown(iv.message)}</div>`;
   timelineEl.appendChild(div);
   scrollTimeline();
@@ -1478,10 +1491,22 @@ function onAwaitingUser(payload) {
 }
 
 function showInterventionBar() {
+  populateInterventionTargets();
   $('interventionBar').classList.remove('hidden');
   $('postBtn').disabled = false;
   $('skipBtn').disabled = false;
   $('endBtn').disabled = false;
+}
+
+// 개입 대상 셀렉트를 현재 참여 에이전트로 채운다 (이전 선택은 유지).
+function populateInterventionTargets() {
+  const sel = $('interventionTarget');
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">전체 (모든 에이전트)</option>'
+    + Object.values(agentsById).map((a) =>
+        `<option value="${escapeHtml(a.agent_id)}">${escapeHtml(a.name)} 에게만</option>`
+      ).join('');
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
 }
 function hideInterventionBar() {
   $('interventionBar').classList.add('hidden');
@@ -1515,10 +1540,11 @@ async function postIntervention() {
   $('postBtn').disabled = true;
   $('skipBtn').disabled = true;
   try {
-    // Participant H 명의로 개입 기록
+    // Participant H 명의로 개입 기록 — 대상 지정 시 그 에이전트에게만 보인다.
     const r = await fetch(`/discussions/${discussionId}/interventions`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, after_phase: lastCompletedPhase }),
+      body: JSON.stringify({ message, after_phase: lastCompletedPhase,
+                             target_agent_id: $('interventionTarget').value || null }),
     });
     if (!r.ok) throw new Error('개입 등록 실패: ' + r.status);
     $('interventionInput').value = '';

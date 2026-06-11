@@ -37,6 +37,34 @@ async def test_phase1_concurrent_isolated_phase2_sequential_keeps_context(
     assert any(SEQ_MARKER in p for p in p2), "2단계(순차)에 선행 의견 누락 — 회귀"
 
 
+async def test_targeted_intervention_visible_only_to_target(
+    orchestrator, make_state, patch_llm,
+):
+    """지향(target) 개입 — 지목된 에이전트의 프롬프트에만 들어간다."""
+    from app.schemas import UserIntervention
+
+    prompts: list[str] = []
+
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        prompts.append(user)
+        return "발언."
+
+    patch_llm(fake)
+    await database.insert_state(make_state(discussion_id="tgt"))   # 알파(a1)·베타(a2)
+
+    await orchestrator.process_event("tgt", PipelineEvent.START)
+    await orchestrator.add_intervention("tgt", UserIntervention(
+        message="SECRET_알파에게만", after_phase="opinion", target_agent_id="a1"))
+    prompts.clear()
+    await orchestrator.process_event("tgt", PipelineEvent.ADVANCE)   # 2단계
+
+    alpha = [p for p in prompts if "너(알파)가 수행할 작업" in p]
+    beta = [p for p in prompts if "너(베타)가 수행할 작업" in p]
+    assert alpha and beta
+    assert "[참가자 H → 너에게] SECRET_알파에게만" in alpha[0]
+    assert "SECRET_알파에게만" not in beta[0], "지향 개입이 다른 에이전트에 누수"
+
+
 async def test_phase1_manual_copy_has_no_peer_posting(
     orchestrator, make_state, make_agent,
 ):
