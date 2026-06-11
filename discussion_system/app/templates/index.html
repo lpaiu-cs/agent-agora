@@ -82,6 +82,11 @@
                    text-slate-200">📂 불러오기</button>
     <input id="loadFileInput" type="file"
            accept=".md,.markdown,text/markdown,text/plain" class="hidden" />
+    <button id="compareBtn"
+            class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
+                   text-slate-200">⚖ 비교</button>
+    <input id="compareFileInput" type="file" multiple
+           accept=".md,.markdown,text/markdown,text/plain" class="hidden" />
     <button id="exportBtn"
             class="text-xs px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600
                    text-slate-200">📄 텍스트 저장</button>
@@ -898,6 +903,112 @@ function buildFacNoteCard(kindLabel, content) {
     + escapeHtml(kindLabel) + '</div>'
     + '<div class="text-sm text-slate-800 md">' + renderMarkdown(content) + '</div>';
   return div;
+}
+
+// ---- 비교 모드 — 두 토론 .md 를 메타 대조표 + 좌우 본문으로 ----------------
+function openCompareFiles() { $('compareFileInput').click(); }
+
+async function onCompareFilesChange(event) {
+  const files = Array.from(event.target.files || []);
+  event.target.value = '';
+  if (files.length !== 2) {
+    alert('비교할 토론 .md 파일을 정확히 2개 선택하세요 (Cmd/Ctrl 클릭으로 복수 선택).');
+    return;
+  }
+  try {
+    const items = await Promise.all(files.map(async (f) => ({
+      name: f.name, text: await f.text(),
+    })));
+    enterCompareMode(items);
+  } catch (e) { alert('파일 읽기 실패: ' + e.message); }
+}
+
+// 내장 상태에서 비교용 메타(라인업·합의 근접도 궤적·토큰 등)를 추출한다.
+// 상태 블록이 없는 구버전 파일이면 null — 표에 '메타 없음' 으로 표기된다.
+function buildCompareMeta(state) {
+  if (!state) return null;
+  const lineup = (state.agents || []).map((a) => a.name + ' (' + a.model + ')');
+  if (state.facilitator) {
+    lineup.push('🎙 ' + state.facilitator.name + ' (' + state.facilitator.model + ')');
+  }
+  const trajectory = (state.phase_summaries || [])
+    .map((s) => Math.round((s.convergence_score || 0) * 100) + '%')
+    .join(' → ');
+  let tokens = 0;
+  const addUsage = (item) => {
+    const u = ((item || {}).metadata || {}).usage || {};
+    tokens += (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+  };
+  Object.values(state.phase_records || {}).forEach((turns) =>
+    (turns || []).forEach(addUsage));
+  (state.facilitator_notes || []).forEach(addUsage);
+  return {
+    topic: state.topic || '',
+    format: state.format_id || '',
+    status: state.status || '',
+    lineup: lineup,
+    phases: Object.keys(state.phase_records || {}).length,
+    trajectory: trajectory || '—',
+    agreement: state.final_joint_agreement ? '있음' : '없음',
+    tokens: tokens,
+  };
+}
+
+function enterCompareMode(items) {
+  resetDiscussion();
+  $('topicCard').classList.add('hidden');
+  $('startBtn').disabled = true;
+  clearTimeline();
+  const ph = $('placeholder'); if (ph) ph.remove();
+
+  const metas = items.map((it) => buildCompareMeta(extractEmbeddedState(it.text)));
+
+  // ── 메타 대조표 ──
+  const rows = [
+    ['주제', (m) => escapeHtml(m.topic.split('\n')[0].slice(0, 80))],
+    ['형식', (m) => escapeHtml((formatsById[m.format] || {}).name || m.format)],
+    ['상태', (m) => escapeHtml(m.status)],
+    ['라인업', (m) => m.lineup.map(escapeHtml).join('<br>')],
+    ['단계 인스턴스', (m) => String(m.phases)],
+    ['합의 근접도 궤적', (m) => escapeHtml(m.trajectory)],
+    ['최종 합의안', (m) => m.agreement],
+    ['토큰 합계', (m) => m.tokens.toLocaleString()],
+  ];
+  const cell = (meta, fn) => meta ? fn(meta)
+    : '<span class="text-slate-400">(구버전 파일 — 메타 없음)</span>';
+  const table = document.createElement('div');
+  table.className = 'bg-white border border-slate-200 rounded-lg p-4 mb-4 text-sm';
+  table.innerHTML =
+    '<div class="font-bold text-slate-600 mb-2">⚖ 토론 비교</div>'
+    + '<table class="w-full text-xs"><thead><tr>'
+    + '<th class="text-left text-slate-400 font-normal w-32 py-1">항목</th>'
+    + items.map((it) =>
+        `<th class="text-left py-1">${escapeHtml(it.name)}</th>`).join('')
+    + '</tr></thead><tbody>'
+    + rows.map(([label, fn]) =>
+        '<tr class="border-t border-slate-100">'
+        + `<td class="text-slate-500 py-1.5 align-top">${label}</td>`
+        + metas.map((m) =>
+            `<td class="py-1.5 align-top pr-3">${cell(m, fn)}</td>`).join('')
+        + '</tr>').join('')
+    + '</tbody></table>';
+  timelineEl.appendChild(table);
+
+  // ── 좌우 본문 (상태 블록 제거 후 통째 마크다운 렌더) ──
+  const grid = document.createElement('div');
+  grid.className = 'grid grid-cols-2 gap-4';
+  items.forEach((it) => {
+    const body = it.text.replace(/<!--\s*AGORA-STATE-V1[\s\S]*?-->/, '');
+    const col = document.createElement('article');
+    col.className = 'md bg-white border border-slate-200 rounded-lg p-4 '
+                  + 'max-h-[70vh] overflow-y-auto';
+    col.innerHTML =
+      `<div class="text-xs font-bold text-slate-400 mb-2">📄 ${escapeHtml(it.name)}</div>`
+      + renderMarkdown(body);
+    grid.appendChild(col);
+  });
+  timelineEl.appendChild(grid);
+  setStatus('⚖ 비교 모드 (읽기 전용)', '');
 }
 
 // 현재 토론의 전체 기록을 마크다운 파일로 로컬 discussions/ 폴더에 저장한다.
@@ -1721,6 +1832,8 @@ $('endBtn').addEventListener('click', endDiscussion);
 $('exportBtn').addEventListener('click', exportDiscussion);
 $('loadBtn').addEventListener('click', openLoadFile);
 $('loadFileInput').addEventListener('change', onLoadFileChange);
+$('compareBtn').addEventListener('click', openCompareFiles);
+$('compareFileInput').addEventListener('change', onCompareFilesChange);
 $('topicInput').addEventListener('input', autoGrowTopic);
 $('formatSelect').addEventListener('change', onFormatChange);
 autoGrowTopic();   // 기본 주제 텍스트에 맞춰 초기 높이 조정
