@@ -294,19 +294,43 @@ class LLMClientPool:
         self._clients.clear()
 
 
+def _openai_sampling_kwargs(
+    model: str, temperature: float, max_tokens: int
+) -> dict:
+    """모델군별 Chat Completions 샘플링 파라미터 — reasoning 모델 호환.
+
+    OpenAI o-시리즈·gpt-5 계열은 ``max_tokens`` 를 거부하고
+    ``max_completion_tokens`` 를 요구하며, temperature 변경도 거부한다(기본값만
+    허용). deepseek-reasoner 는 temperature 류 샘플링 파라미터를 지원하지
+    않는다. 일반 모델은 종전 그대로.
+    """
+    name = model.lower()
+    if name.startswith(("o1", "o3", "o4", "gpt-5")):
+        return {"max_completion_tokens": max_tokens}
+    if name.startswith("deepseek-reasoner"):
+        return {"max_tokens": max_tokens}
+    return {"temperature": temperature, "max_tokens": max_tokens}
+
+
 async def _call_openai(
     client: object, model: str, system: str, user: str,
     temperature: float, max_tokens: int, on_token: Optional[TokenCallback],
 ) -> tuple[str, dict]:
-    """OpenAI Chat Completions 스트리밍 호출. (누적 텍스트, 토큰 사용량) 반환."""
+    """OpenAI(호환) Chat Completions 스트리밍 호출. (누적 텍스트, 사용량) 반환.
+
+    reasoning 모델의 사고 과정(``delta.reasoning_content`` — DeepSeek 확장)은
+    스트리밍 콜백으로만 흘려 사용자에게 보여 주고, 반환 텍스트(=발언)에는
+    넣지 않는다.
+    """
     stream = await client.chat.completions.create(  # type: ignore[attr-defined]
         model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=temperature, max_tokens=max_tokens, stream=True,
+        stream=True,
         stream_options={"include_usage": True},
+        **_openai_sampling_kwargs(model, temperature, max_tokens),
     )
     parts: list[str] = []
     usage: dict = {}
@@ -317,7 +341,11 @@ async def _call_openai(
                      "completion_tokens": chunk_usage.completion_tokens}
         if not chunk.choices:
             continue
-        delta = chunk.choices[0].delta.content
+        delta_obj = chunk.choices[0].delta
+        reasoning = getattr(delta_obj, "reasoning_content", None)
+        if reasoning and on_token is not None:
+            await on_token(reasoning)
+        delta = delta_obj.content
         if delta:
             parts.append(delta)
             if on_token is not None:
