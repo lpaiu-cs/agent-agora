@@ -196,6 +196,36 @@ async def test_socratic_probe_caps_at_max_rounds_when_not_converging(
     assert {"position", "synthesis"} <= set(st.phase_records)
 
 
+async def test_gate_payload_reports_token_budget_state(
+    orchestrator, make_state, patch_llm,
+):
+    """AWAITING_USER 페이로드 — 누적 사용량·예산·초과 여부를 싣는다 (소프트 상한)."""
+    async def fake(client, model, system, user, temperature, max_tokens, on_token):
+        return ("발언.", {"prompt_tokens": 400, "completion_tokens": 200})
+
+    patch_llm(fake)
+    state = make_state(discussion_id="bud", token_budget=1000)
+    await database.insert_state(state)
+    await orchestrator.process_event("bud", PipelineEvent.START)
+
+    gates = [m for _, m in orchestrator.broadcasts
+             if m.type.value == "awaiting_user"]
+    assert gates, "게이트 메시지가 없다"
+    p = gates[-1].payload
+    # 에이전트 2명 × (400+200) = 1200 ≥ 예산 1000 → 초과.
+    assert p["tokens_used"] == 1200
+    assert p["token_budget"] == 1000
+    assert p["budget_exceeded"] is True
+    # 예산 미지정 토론은 초과 플래그가 항상 False.
+    await database.insert_state(make_state(discussion_id="nobud"))
+    orchestrator.broadcasts.clear()
+    await orchestrator.process_event("nobud", PipelineEvent.START)
+    p2 = [m for _, m in orchestrator.broadcasts
+          if m.type.value == "awaiting_user"][-1].payload
+    assert p2["token_budget"] is None
+    assert p2["budget_exceeded"] is False
+
+
 async def test_end_event_completes_discussion_at_gate(
     orchestrator, make_state, patch_llm,
 ):

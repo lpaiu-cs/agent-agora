@@ -57,6 +57,18 @@ def test_create_discussion_with_reference_materials(client):
     assert client.get(f"/discussions/{did2}").json()["reference_materials"] is None
 
 
+def test_create_discussion_with_token_budget(client):
+    r = client.post("/discussions", json={
+        "topic": "예산 토론", "agents": _manual_agents(), "token_budget": 50000})
+    assert r.status_code == 201
+    did = r.json()["discussion_id"]
+    assert client.get(f"/discussions/{did}").json()["token_budget"] == 50000
+    # 0 이하 예산은 거부 (gt=0).
+    assert client.post("/discussions", json={
+        "topic": "t", "agents": _manual_agents(),
+        "token_budget": 0}).status_code == 422
+
+
 def test_create_discussion_rejects_single_agent(client):
     r = client.post("/discussions", json={
         "topic": "t", "agents": _manual_agents()[:1]})

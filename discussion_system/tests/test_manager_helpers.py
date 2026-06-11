@@ -13,6 +13,7 @@ from app.manager import (
     extract_embedded_state,
     render_transcript,
     render_transcript_with_state,
+    total_token_usage,
 )
 from app.schemas import (
     AgentConfig,
@@ -140,6 +141,24 @@ def test_parse_facilitator_targets():
     assert targets == {"알파": "누수 임계값을 숫자로 제시하라",
                        "베타": "decay 상수의 근거는?"}
     assert _parse_facilitator_targets("지목 없는 코멘트") == {}
+
+
+def test_total_token_usage_counts_turns_and_facilitator_notes():
+    state = _state(ModelProvider.OPENAI, ModelProvider.OPENAI)
+    state.phase_records = {"opinion": [
+        AgentTurn(agent_id="a0", phase="opinion", content="x",
+                  metadata={"usage": {"prompt_tokens": 100, "completion_tokens": 50}}),
+        AgentTurn(agent_id="a1", phase="opinion", content="y",
+                  metadata={}),   # usage 없는 턴(수동 등)은 0 으로
+    ]}
+    state.facilitator_notes = [FacilitatorNote(
+        phase="opinion", kind="between", content="노트",
+        metadata={"usage": {"prompt_tokens": 30, "completion_tokens": 20}})]
+    usage = total_token_usage(state)
+    assert usage == {"prompt": 130, "completion": 70, "total": 200}
+    # 빈 토론은 전부 0.
+    assert total_token_usage(
+        _state(ModelProvider.OPENAI, ModelProvider.OPENAI))["total"] == 0
 
 
 # ---------------------------------------------------------------------------

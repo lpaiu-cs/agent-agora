@@ -121,6 +121,7 @@ async def create_discussion(
         facilitator=req.facilitator,
         force_consensus=req.force_consensus,
         reference_materials=req.reference_materials,
+        token_budget=req.token_budget,
     )
     await database.insert_state(state)
     orchestrator.trigger(discussion_id, PipelineEvent.START)

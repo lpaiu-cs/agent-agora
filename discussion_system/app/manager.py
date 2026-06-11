@@ -543,6 +543,23 @@ def _render_phase_summary(
     return "\n".join(lines)
 
 
+def total_token_usage(state: DiscussionState) -> dict:
+    """누적 토큰 사용량 — 에이전트 발언 + 사회자 노트의 usage 메타데이터 합산.
+
+    토큰 예산(``token_budget``) 판정과 기록 문서·게이트 표시가 공유한다.
+    (단계 요약 등 시스템 호출의 사용량은 메타데이터에 남지 않아 미포함.)
+    """
+    prompt = completion = 0
+    records = [t for turns in state.phase_records.values() for t in turns]
+    records += state.facilitator_notes
+    for item in records:
+        used = (item.metadata or {}).get("usage") or {}
+        prompt += used.get("prompt_tokens", 0) or 0
+        completion += used.get("completion_tokens", 0) or 0
+    return {"prompt": prompt, "completion": completion,
+            "total": prompt + completion}
+
+
 def _intervention_lines(
     state: DiscussionState,
     interventions: list[UserIntervention],
@@ -887,16 +904,13 @@ def render_transcript(state: DiscussionState) -> str:
         f"- 생성: {state.created_at:%Y-%m-%d %H:%M} · "
         f"갱신: {state.updated_at:%Y-%m-%d %H:%M}",
     ]
-    total_p = total_c = 0
-    for turns in state.phase_records.values():
-        for turn in turns:
-            used = (turn.metadata or {}).get("usage") or {}
-            total_p += used.get("prompt_tokens", 0)
-            total_c += used.get("completion_tokens", 0)
-    if total_p or total_c:
+    usage = total_token_usage(state)
+    if usage["total"]:
+        budget = (f" / 예산 {state.token_budget:,}"
+                  if state.token_budget else "")
         lines.append(
-            f"- 토큰(에이전트 발언): 입력 {total_p:,} · 출력 {total_c:,} "
-            f"· 합계 {total_p + total_c:,}")
+            f"- 토큰: 입력 {usage['prompt']:,} · 출력 {usage['completion']:,} "
+            f"· 합계 {usage['total']:,}{budget}")
     lines += ["", "## 참여 에이전트", ""]
     lines += [f"- **{a.name}** (`{a.agent_id}`) — {a.model}" for a in state.agents]
     if state.facilitator is not None:
@@ -1624,12 +1638,18 @@ class Orchestrator:
             if not facilitated_gate:
                 await self._run_facilitator(discussion_id, "between", phase)
             nxt_spec = fmt.phase(nxt)
+            usage = total_token_usage(state)
             await self._emit(
                 discussion_id, WSMessageType.AWAITING_USER,
                 {"completed_phase": phase, "next_phase": nxt,
                  "next_round": round_of_key(nxt),
                  "next_label": _instance_label(nxt_spec, round_of_key(nxt)),
-                 "facilitator_decision": decision},
+                 "facilitator_decision": decision,
+                 "tokens_used": usage["total"],
+                 "token_budget": state.token_budget,
+                 "budget_exceeded": bool(
+                     state.token_budget
+                     and usage["total"] >= state.token_budget)},
             )
 
     async def _end_discussion(self, discussion_id: str) -> None:

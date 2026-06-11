@@ -332,6 +332,14 @@ class DiscussionState(BaseModel):
             "None 이면 동작 불변 — 주제에 따라 강제하지 않는다."
         ),
     )
+    token_budget: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "선택 토큰 예산 (발언+사회자 노트 합계 기준). 초과해도 강제 중단은 "
+            "없다 — 게이트에서 경고·종료 권고만 한다 (소프트 상한)."
+        ),
+    )
 
     # --- 타임스탬프 / 오류 ---
     created_at: datetime = Field(default_factory=_utcnow)
@@ -387,6 +395,10 @@ class CreateDiscussionRequest(BaseModel):
     reference_materials: Optional[str] = Field(
         default=None,
         description="선택 참고 자료 — 지정 시에만 에이전트가 인용 규칙을 적용한다",
+    )
+    token_budget: Optional[int] = Field(
+        default=None, gt=0,
+        description="선택 토큰 예산 — 게이트에서 경고·종료 권고 (강제 중단 아님)",
     )
 
 
