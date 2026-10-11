@@ -341,6 +341,9 @@ Ollama). Gemini·DeepSeek 은 각자의 OpenAI-호환 엔드포인트를 쓰며,
   `anthropic` · `ollama` · `sqlalchemy>=2.0` · `aiosqlite` · `asyncpg`
   (전체 목록은 `discussion_system/requirements.txt`)
 - Docker 이미지는 `python:3.12-slim` 기반 멀티 스테이지 빌드
+- 테스트: `pip install -r requirements-dev.txt` 후 `pytest`. 브라우저 `.md` 복원 파서
+  회귀 테스트는 **Node.js 16+**(`node`) 로 실제 `index.html` 파서를 실행하며, Node.js 가
+  없으면 그 테스트만 skip 된다.
 
 ---
 

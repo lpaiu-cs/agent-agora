@@ -1,5 +1,7 @@
 # 개발 / 테스트 전용 의존성 — 런타임(requirements.txt)에는 불필요하다.
 #   pip install -r requirements.txt -r requirements-dev.txt
 #   pytest
+# 브라우저 A2 파서 회귀 테스트(tests/test_a2_parser_js.py)는 Node.js(`node`) 로
+# index.html 의 실제 파서를 실행한다 — Node.js 16+ 를 PATH 에 두고, 없으면 그 테스트만 skip 된다.
 pytest>=8.0
 pytest-asyncio>=0.24

@@ -729,7 +729,7 @@ function enterViewMode(markdown, filename) {
 
 // ---- A2 복원 힌트 디코더 + 길이 앵커 파서 ---------------------------------
 // 서버가 .md 끝에 <!-- A2 <base64> --> 한 줄로 심는 초소형 힌트를 푼다.
-// 내용: 에이전트별 persona_type(색) · 발언별 정확한 길이(앵커). 발언 원문은
+// 내용: 에이전트별 persona_type(색) · 자유 텍스트 블록별 정확한 길이(앵커). 원문은
 // 본문에 있으므로 중복 저장하지 않는다. (인덱스=서버 _PERSONA_TABLE 와 동일 순서)
 const PERSONA_TABLE = ['ideator', 'builder', 'critic', 'synthesizer',
   'pragmatist', 'neutral', 'proponent', 'opponent', 'fact_checker',
@@ -742,7 +742,7 @@ function decodeMetaA2(md) {
     const b = Uint8Array.from(atob(m[1]), (c) => c.charCodeAt(0));
     let p = 0;
     const version = b[p++];
-    if (version !== 3 && version !== 4) return null; // 알 수 없는 버전
+    if (version < 3 || version > 5) return null; // 알 수 없는 버전
     const ac = b[p++];
     const idxs = [];
     for (let k = 0; k < Math.ceil(ac / 2); k++) {  // 니블 → persona 인덱스 2개
@@ -765,9 +765,9 @@ function decodeMetaA2(md) {
     const lens = [];
     for (let i = 0; i < tc; i++) {
       if (version === 3) lens.push(b[p++] << 5);  // 과거 v3: 양자화 하한
-      else lens.push(rd());                        // v4: 정확한 코드포인트 길이
+      else lens.push(rd());                        // v4·v5: 정확한 코드포인트 길이
     }
-    return { version, types, lens, exactLengths: version === 4 };
+    return { version, types, lens };
   } catch (e) { return null; }
 }
 
@@ -920,92 +920,97 @@ function parseWithAnchors(md, meta) {
   return out;
 }
 
-// v4 A2는 발언의 정확한 코드포인트 길이를 담는다. 한 발언을 먼저 정확히 소비한
-// 다음에야 다음 `### {로스터이름}` 헤더를 찾으므로, 발언 본문 속 같은 헤더는
-// 경계 후보로 보지 않는다. v3 파일은 위의 근사 앵커 파서를 계속 사용한다.
-function parseWithExactAnchors(md, meta) {
+// v5 A2는 render_transcript 가 펼친 '모든' 자유 텍스트(주제·참고 자료·개입·사회자
+// 노트·발언·쟁점·합의안)의 정확한 코드포인트 길이를 본문 순서대로 담는다. 렌더러가
+// 만든 구조 줄만 읽고 자유 텍스트는 길이만큼 통째로 소비하므로, 그 안의 `## `·
+// `### 이름` 은 경계 후보가 되지 않는다. 구조가 어긋나면 null(패턴 파서로 폴백).
+function parseWithBlockLengths(md, meta) {
   const text = stripAgoraComments(md).replace(/\r\n/g, '\n');
-  const lines = text.split('\n');
-  const offsets = [];
-  let offset = 0;
-  lines.forEach((line) => { offsets.push(offset); offset += line.length + 1; });
   const out = { topic: '', agents: [], facilitator: null, preInstructions: [],
                 referenceMaterials: null, openNote: null, closeNote: null,
                 agreement: null, phases: [] };
-
-  let i0 = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+참여 에이전트\s*$/.test(lines[i])) { i0 = i; break; }
-  }
-  if (i0 < 0) return null;
-
-  const pre = lines.slice(0, i0);
-  for (let i = 0; i < pre.length; i++) {
-    const m = pre[i].match(/^#\s+Agent Agora\s+—\s*(.*)$/);
-    if (m) { pre[i] = m[1]; break; }
-  }
-  while (pre.length) {
-    const l = pre[pre.length - 1].trim();
-    if (l === '' || /^- (형식|상태|생성|갱신|토큰)/.test(l)) pre.pop(); else break;
-  }
-  out.topic = pre.join('\n').trim();
-
-  let j = i0 + 1;
-  for (; j < lines.length && !/^##\s+/.test(lines[j]); j++) {
-    let m = lines[j].match(/^-\s+\*\*(.+?)\*\*\s+\(`([^`]+)`\)\s+—\s+(.+)$/);
-    if (m) { out.agents.push({ name: m[1], id: m[2], model: m[3] }); continue; }
-    m = lines[j].match(/^-\s+사회자:\s*\*\*(.+?)\*\*\s+—\s+(.+)$/);
-    if (m) out.facilitator = { name: m[1], model: m[2] };
-  }
-  const roster = new Set(out.agents.map((a) => a.name));
-  const speakerAt = (idx) => {
-    const m = (lines[idx] || '').match(/^###\s+(.+?)\s*$/);
-    return m && roster.has(m[1].trim()) ? m[1].trim() : null;
-  };
-  const nextSpeaker = (from) => {
-    for (let i = from; i < lines.length; i++) {
-      const speaker = speakerAt(i);
-      if (speaker) return { idx: i, speaker };
+  let pos = 0, k = 0;
+  const lineEnd = () => { const e = text.indexOf('\n', pos); return e < 0 ? text.length : e; };
+  const line = () => text.slice(pos, lineEnd());
+  const next = () => { pos = Math.min(lineEnd() + 1, text.length); };
+  const expect = (ok) => { if (!ok) throw new Error('A2 구조 불일치'); };
+  // pos+skip 부터 다음 앵커 길이만큼 소비하고, 같은 줄의 나머지가 suffix 인지 확인한다.
+  const inline = (skip, suffix = '') => {
+    expect(k < meta.lens.length);
+    const from = pos + skip;
+    let p = from;
+    for (let n = meta.lens[k++]; n > 0; n--) {
+      expect(p < text.length);
+      p += text.codePointAt(p) > 0xFFFF ? 2 : 1;
     }
-    return null;
+    pos = p;
+    expect(line() === suffix);
+    next();
+    return text.slice(from, p);
   };
-  const lineAtOrAfter = (pos) => {
-    for (let i = 0; i < lines.length; i++) if (offsets[i] >= pos) return i;
-    return lines.length;
-  };
-  const takeCodePoints = (from, count) => [...text.slice(from)].slice(0, count).join('');
+  // `헤더` / 빈 줄 / 본문 — 렌더러가 넣은 빈 줄 하나를 넘기고 본문을 소비한다.
+  const body = () => { next(); expect(line() === ''); next(); return inline(0); };
 
-  let header = nextSpeaker(j);
-  if (!header) return null;
-  parseInterstitial(lines.slice(j, header.idx), out, true, null);
-  let curPhase = { label: out._pendingPhaseLabel || '진행', turns: [], summary: null,
-                   interventions: [], notes: [] };
-  out.phases.push(curPhase);
-  delete out._pendingPhaseLabel;
-
-  for (let t = 0; t < meta.lens.length; t++) {
-    if (!header) return null;  // 힌트 발언 수와 본문이 맞지 않으면 안전하게 폴백한다.
-    let bodyLine = header.idx + 1;
-    if (lines[bodyLine] === '') bodyLine += 1;  // 렌더러가 넣은 헤더 뒤 빈 줄
-    const bodyStart = bodyLine < lines.length ? offsets[bodyLine] : text.length;
-    const content = takeCodePoints(bodyStart, meta.lens[t]);
-    const contentEnd = bodyStart + content.length;
-    const nextBodyLine = lineAtOrAfter(contentEnd);
-    const following = nextSpeaker(nextBodyLine);
-    const interEnd = following ? following.idx : lines.length;
-
-    // 길이가 정확하므로 trim 하지 않는다. 선행/후행 공백도 발언 원문의 일부다.
-    curPhase.turns.push({ speaker: header.speaker, content });
-    const adv = parseInterstitial(lines.slice(nextBodyLine, interEnd), out, false, curPhase);
-    if (adv.nextLabel != null) {
-      curPhase = { label: adv.nextLabel, turns: [], summary: null,
-                   interventions: [], notes: [] };
-      out.phases.push(curPhase);
+  const TITLE = '# Agent Agora — ';
+  try {
+    expect(text.startsWith(TITLE));
+    out.topic = inline(TITLE.length);
+    let section = 'head', phase = null, m;
+    while (pos < text.length) {
+      const ln = line();
+      if (ln === '') { next(); continue; }
+      if ((m = ln.match(/^## (.+)$/))) {
+        section = null;
+        if (m[1] === '참여 에이전트') { section = 'agents'; next(); }
+        else if (m[1] === '진행자 사전 지시') { section = 'pre'; next(); }
+        else if (m[1] === '참고 자료') out.referenceMaterials = body();
+        else if (m[1] === '사회자 — 개회') out.openNote = body();
+        else if (m[1] === '사회자 — 폐회') out.closeNote = body();
+        else if (m[1] === '최종 합의안') out.agreement = body();
+        else {
+          phase = { label: m[1], turns: [], summary: null, interventions: [], notes: [] };
+          out.phases.push(phase);
+          section = 'phase';
+          next();
+        }
+      } else if (section === 'head' && ln.startsWith('- ')) {
+        next();
+      } else if (section === 'agents'
+                 && (m = ln.match(/^- \*\*(.+?)\*\* \(`([^`]+)`\) — (.+)$/))) {
+        out.agents.push({ name: m[1], id: m[2], model: m[3] });
+        next();
+      } else if (section === 'agents' && (m = ln.match(/^- 사회자: \*\*(.+?)\*\* — (.+)$/))) {
+        out.facilitator = { name: m[1], model: m[2] };
+        next();
+      } else if (section === 'pre' && ln.startsWith('> ')) {
+        out.preInstructions.push(inline(2));
+      } else if (section === 'phase' && (m = ln.match(/^### (.+)$/))) {
+        phase.turns.push({ speaker: m[1], content: body() });
+      } else if (section === 'phase' && (m = ln.match(/^_단계 요약 · 합의 근접도 (\d+)%_$/))) {
+        phase.summary = Object.assign(phase.summary || {}, { pct: +m[1] });
+        next();
+      } else if (section === 'phase' && ln.startsWith('_주요 쟁점: ')) {
+        phase.summary = phase.summary || {};
+        phase.summary.conflicts = inline('_주요 쟁점: '.length, '_');
+      } else if (section === 'phase' && (m = ln.match(/^> 진행자 개입(?: \(→ (.+?)\))?: /))) {
+        phase.interventions.push({ target: m[1] || null, message: inline(m[0].length) });
+      } else if (section === 'phase' && (m = ln.match(/^\*\*사회자 · (.+)\*\*$/))) {
+        phase.notes.push({ kind: m[1], content: body() });
+      } else {
+        expect(false);
+      }
     }
-    header = following;
-  }
-  out.phases = out.phases.filter((p) => p.turns.length || p.summary || p.notes.length);
+    expect(k === meta.lens.length);
+  } catch (e) { return null; }
   return out;
+}
+
+// 저장된 .md → 구조화 결과. v5 힌트는 정확한 블록 파서, v3·v4(발언 길이만)는 근사
+// 앵커 파서, 힌트가 없거나 실패하면 패턴 파서(비엄밀 폴백).
+function parseLoadedTranscript(md, meta) {
+  return (meta && (meta.version === 5 ? parseWithBlockLengths(md, meta)
+                                      : parseWithAnchors(md, meta)))
+    || parseAgoraTranscript(md);
 }
 
 // ---- 저장된 .md 토론을 라이브 UI 구조로 복원 (패턴 기반, 비엄밀) ------------
@@ -1110,9 +1115,7 @@ const LOADED_BUBBLE_PALETTE = ['ideator', 'builder', 'critic',
                                'synthesizer', 'pragmatist', 'analyst'];
 
 function renderLoadedTranscript(md, meta) {
-  // A2 힌트가 있으면 길이 앵커 파서(견고), 없으면 패턴 파서(비엄밀 폴백).
-  const parsed = (meta && ((meta.exactLengths && parseWithExactAnchors(md, meta))
-    || parseWithAnchors(md, meta))) || parseAgoraTranscript(md);
+  const parsed = parseLoadedTranscript(md, meta);
   if (!parsed) return false;
   const speakerColor = {};
   parsed.agents.forEach((a, i) => {
@@ -1278,8 +1281,7 @@ function buildCompareMeta(state) {
 // A2 힌트(또는 폴백)로 본문을 파싱해 비교용 메타를 만든다 — 전체상태 블록 없이도 동작.
 function buildCompareMetaFromBody(md) {
   const meta = decodeMetaA2(md);
-  const parsed = (meta && ((meta.exactLengths && parseWithExactAnchors(md, meta))
-    || parseWithAnchors(md, meta))) || parseAgoraTranscript(md);
+  const parsed = parseLoadedTranscript(md, meta);
   if (!parsed) return null;
   const lineup = (parsed.agents || []).map((a) => a.name + ' (' + a.model + ')');
   if (parsed.facilitator) {

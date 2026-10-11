@@ -195,11 +195,11 @@ def test_meta_hint_round_trip():
     meta = decode_meta_hint(payload)
     assert "fmt" not in meta                       # format_id 는 본문에서 읽으므로 미포함
     assert meta["types"] == [a.persona_type for a in state.agents]
-    # 길이 앵커 = 본문 순서대로의 정확한 코드포인트 길이.
-    contents = manager._ordered_turn_contents(state)
-    assert meta["version"] == 4
-    assert meta["exact_lengths"] is True
-    assert meta["lens"] == [len(c) for c in contents]
+    # 길이 앵커 = 본문에 펼친 모든 자유 텍스트(주제·발언·노트…)의 정확한 길이, 본문 순서.
+    blocks = manager._render_transcript_parts(state)[1]
+    assert blocks == [state.topic, "## 헤더 발언 --> 끝", "사회자 노트"]
+    assert meta["version"] == 5
+    assert meta["lens"] == [len(b) for b in blocks]
 
 
 def test_meta_hint_keeps_exact_long_turn_length():
@@ -208,11 +208,11 @@ def test_meta_hint_keeps_exact_long_turn_length():
     content = "앞부분\n## 본문 안의 헤더\n" + "x" * 9_000
     state.phase_records["opinion"][0].content = content
     meta = decode_meta_hint(encode_meta_hint(state))
-    assert meta["lens"] == [len(content)]
+    assert meta["lens"][1] == len(content)   # [주제, 발언, 노트] 순서
 
 
 def test_decode_meta_hint_rejects_unknown_version():
-    # v3 외 버전(예: 손상/구버전 바이트)은 None 으로 조용히 폴백.
+    # v3~v5 외 버전(예: 손상/구버전 바이트)은 None 으로 조용히 폴백.
     assert decode_meta_hint(base64.b64encode(bytes([2, 0, 0])).decode()) is None
 
 
