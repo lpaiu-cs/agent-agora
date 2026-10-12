@@ -271,6 +271,25 @@ let lastConvergence = null;    // 가장 최근 단계의 합의 근접도 (0~1)
 let hasFacilitator = false;    // 사회자 슬롯 여부 — H 개입의 between 재작성 분기에 쓴다
 let tokenBudget = null;        // 토론의 토큰 예산 (선택 — null 이면 무제한)
 
+// ---- 세션 지속(persist) — 뒤로가기·새로고침 후 자동 재접속 ------------------
+// discussionId 는 메모리 변수라, 뒤로가기 등으로 페이지가 리셋되면 진행 중 토론과의
+// 연결이 끊긴다(데이터는 DB 에 살아있음). sessionStorage 에 보존해 두면 부팅 시
+// 자동 재접속해 서버 스냅샷으로 UI 를 그대로 복원할 수 있다.
+// 탭 단위(sessionStorage)여야 한다 — origin 공용(localStorage)이면 다른 탭의 토론
+// 시작·리셋이 이 탭의 복구 ID 를 덮어쓰거나 지워, 새로고침 시 엉뚱한 토론에 붙는다.
+// URL 에는 넣지 않는다 — 토론 ID 는 인증 없이 조회·개입 권한을 주므로, 주소를
+// 복사해 공유하는 순간 토론이 함께 넘어간다.
+const SESSION_KEY = 'agora.discussionId';
+function saveSession(id) {
+  try { sessionStorage.setItem(SESSION_KEY, id); } catch (e) { /* 사생활 모드 등 */ }
+}
+function clearSession() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+function savedSession() {
+  try { return (sessionStorage.getItem(SESSION_KEY) || '').trim() || null; } catch (e) { return null; }
+}
+
 // ---- DOM 핸들 --------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const timelineEl = $('timeline');
@@ -614,6 +633,7 @@ async function startDiscussion() {
 // 진행 중이던 토론 연결을 끊고 UI 를 시작 전 상태로 되돌린다 (설정 폼은 유지).
 function resetDiscussion() {
   discussionId = null;   // scheduleReconnect 가 즉시 멈추도록 가장 먼저 비운다
+  clearSession();        // 저장된 ID 제거 — 다음 부팅에서 자동 재접속하지 않도록
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
   wsReconnectAttempts = 0;
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
@@ -690,18 +710,307 @@ function enterViewMode(markdown, filename) {
     } catch (e) { /* 구조 불일치 — 아래 폴백으로 */ }
   }
 
-  // 2순위: 패턴 파싱(구버전 파일 — 상태 블록 없음), 3순위: 통째 렌더.
+  // 2순위: 본문 파싱(+A2 길이 앵커 힌트), 3순위: 통째 렌더.
   $('topicCard').classList.add('hidden');   // 파싱 경로는 자체 주제 카드를 만든다
   let structured = false;
-  try { structured = renderLoadedTranscript(markdown); } catch (e) { structured = false; }
+  const meta = decodeMetaA2(markdown);
+  try { structured = renderLoadedTranscript(markdown, meta); } catch (e) { structured = false; }
   if (!structured) {
     const card = document.createElement('article');
     card.id = 'loadedCard';
     card.className = 'md bg-white border border-slate-200 rounded-lg p-5';
-    card.innerHTML = renderMarkdown(markdown);
+    card.innerHTML = renderMarkdown(stripAgoraComments(markdown));
     timelineEl.appendChild(card);
   }
   setStatus('📂 ' + filename + ' (읽기 전용)', '');
+}
+
+// ---- A2 복원 힌트 디코더 + 길이 앵커 파서 ---------------------------------
+// 서버가 .md 끝에 <!-- A2 <base64> --> 한 줄로 심는 초소형 힌트를 푼다.
+// 내용: 에이전트별 persona_type(색) · 자유 텍스트 블록별 정확한 길이(앵커). 원문은
+// 본문에 있으므로 중복 저장하지 않는다. (인덱스=서버 _PERSONA_TABLE 와 동일 순서)
+const PERSONA_TABLE = ['ideator', 'builder', 'critic', 'synthesizer',
+  'pragmatist', 'neutral', 'proponent', 'opponent', 'fact_checker',
+  'mediator', 'analyst'];
+
+function decodeMetaA2(md) {
+  const m = String(md || '').match(/<!--\s*A2\s+([A-Za-z0-9+/=]+)\s*-->/);
+  if (!m) return null;
+  try {
+    const b = Uint8Array.from(atob(m[1]), (c) => c.charCodeAt(0));
+    let p = 0;
+    const version = b[p++];
+    if (version < 3 || version > 5) return null; // 알 수 없는 버전
+    const ac = b[p++];
+    const idxs = [];
+    for (let k = 0; k < Math.ceil(ac / 2); k++) {  // 니블 → persona 인덱스 2개
+      const byte = b[p++];
+      idxs.push((byte >> 4) & 0xF, byte & 0xF);
+    }
+    idxs.length = ac;
+    const types = idxs.map((i) => (i < PERSONA_TABLE.length ? PERSONA_TABLE[i] : null));
+    const rd = () => {   // 부호 없는 LEB128 varint
+      let r = 0, s = 0;
+      for (;;) {
+        const x = b[p++];
+        if (x === undefined || s > 49) throw new Error('손상된 varint');
+        r += (x & 0x7F) * 2 ** s;
+        if (!(x & 0x80)) return r;
+        s += 7;
+      }
+    };
+    const tc = rd();
+    const lens = [];
+    for (let i = 0; i < tc; i++) {
+      if (version === 3) lens.push(b[p++] << 5);  // 과거 v3: 양자화 하한
+      else lens.push(rd());                        // v4·v5: 정확한 코드포인트 길이
+    }
+    return { version, types, lens };
+  } catch (e) { return null; }
+}
+
+// .md 에서 기계용 복원 주석(V1 전체상태·A2 힌트)을 제거한 사람용 본문만 돌려준다.
+function stripAgoraComments(md) {
+  return String(md || '')
+    .replace(/<!--\s*AGORA-STATE-V1[\s\S]*?-->/g, '')
+    .replace(/<!--\s*A2\s+[A-Za-z0-9+/=]+\s*-->/g, '');
+}
+
+// 코드포인트 길이(서버 len() 과 일치 — 이모지도 1로 세도록 스프레드 사용).
+function cpLen(line) { return [...line].length; }
+
+// 한 발언의 꼬리(또는 머리말)에 섞인 비-발언 요소를 파싱한다: 요약·사회자 노트·
+// 진행자 개입·다음 단계 헤더·개회/폐회/합의안. 다음 단계 라벨을 만나면 반환한다.
+function parseInterstitial(region, out, isPreamble, curPhase) {
+  const res = { nextLabel: null };
+  let mode = null, kind = null, buf = [];
+  const flush = () => {
+    const c = buf.join('\n').trim();
+    if (mode === 'open') out.openNote = c;
+    else if (mode === 'close') out.closeNote = c;
+    else if (mode === 'agreement') out.agreement = c;
+    else if (mode === 'note' && curPhase) curPhase.notes.push({ kind, content: c });
+    else if (mode === 'ref') out.referenceMaterials = c;
+    buf = []; mode = null; kind = null;
+  };
+  for (const ln of region) {
+    let m = ln.match(/^##\s+(.+?)\s*$/);
+    if (m) {
+      flush();
+      const h = m[1].trim();
+      if (h === '사회자 — 개회') mode = 'open';
+      else if (h === '사회자 — 폐회') mode = 'close';
+      else if (h === '최종 합의안') mode = 'agreement';
+      else if (h === '참고 자료') mode = 'ref';
+      else if (h === '진행자 사전 지시') mode = 'pre';
+      else if (h === '참여 에이전트') mode = null;
+      else if (isPreamble) out._pendingPhaseLabel = h;   // 첫 단계 라벨(마지막이 이김)
+      else res.nextLabel = h;                            // 꼬리 → 다음 단계 시작
+      continue;
+    }
+    m = ln.match(/^\*\*사회자 · (.+?)\*\*\s*$/);
+    if (m) { flush(); mode = 'note'; kind = m[1].trim(); continue; }
+    m = ln.match(/^_단계 요약 · 합의 근접도 (\d+)%_/);
+    if (m) { flush(); if (curPhase) { curPhase.summary = curPhase.summary || {}; curPhase.summary.pct = +m[1]; } continue; }
+    m = ln.match(/^_주요 쟁점:\s*(.+?)_\s*$/);
+    if (m) { if (curPhase) { curPhase.summary = curPhase.summary || {}; curPhase.summary.conflicts = m[1].trim(); } continue; }
+    m = ln.match(/^>\s*진행자 개입(?:\s+\(→\s*(.+?)\))?:\s*(.+)$/);
+    if (m) {
+      flush();
+      if (curPhase) curPhase.interventions.push({ target: m[1] || null, message: m[2].trim() });
+      continue;
+    }
+    if (mode === 'pre') { const mm = ln.match(/^>\s?(.*)$/); if (mm && mm[1].trim()) out.preInstructions.push(mm[1].trim()); continue; }
+    if (mode === 'open' || mode === 'close' || mode === 'agreement'
+        || mode === 'note' || mode === 'ref') buf.push(ln);
+  }
+  flush();
+  return res;
+}
+
+// 길이 앵커 기반 견고 파서: 발언 경계는 `### {로스터이름}` 으로만 끊고, 각 발언의
+// 끝은 힌트의 길이값으로 찾는다 → 발언 본문에 `## `/`### ` 가 섞여도 흡수된다.
+function parseWithAnchors(md, meta) {
+  const text = stripAgoraComments(md).replace(/\r\n/g, '\n');
+  const lines = text.split('\n');
+  const out = { topic: '', agents: [], facilitator: null, preInstructions: [],
+                referenceMaterials: null, openNote: null, closeNote: null,
+                agreement: null, phases: [] };
+
+  let i0 = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+참여 에이전트\s*$/.test(lines[i])) { i0 = i; break; }
+  }
+  if (i0 < 0) return null;
+
+  // 머리말 → 주제 (제목 프리픽스 제거 + 끝의 메타 불릿 제거).
+  const pre = lines.slice(0, i0);
+  for (let i = 0; i < pre.length; i++) {
+    const m = pre[i].match(/^#\s+Agent Agora\s+—\s*(.*)$/);
+    if (m) { pre[i] = m[1]; break; }
+  }
+  while (pre.length) {
+    const l = pre[pre.length - 1].trim();
+    if (l === '' || /^- (형식|상태|생성|갱신|토큰)/.test(l)) pre.pop(); else break;
+  }
+  out.topic = pre.join('\n').trim();
+
+  // 참여 에이전트 섹션 → 로스터(이름·id·model) + 사회자.
+  let j = i0 + 1;
+  for (; j < lines.length && !/^##\s+/.test(lines[j]); j++) {
+    let m = lines[j].match(/^-\s+\*\*(.+?)\*\*\s+\(`([^`]+)`\)\s+—\s+(.+)$/);
+    if (m) { out.agents.push({ name: m[1], id: m[2], model: m[3] }); continue; }
+    m = lines[j].match(/^-\s+사회자:\s*\*\*(.+?)\*\*\s+—\s+(.+)$/);
+    if (m) out.facilitator = { name: m[1], model: m[2] };
+  }
+  const roster = new Set(out.agents.map((a) => a.name));
+
+  // 발언 시작 = `### {로스터이름}` (에이전트는 이 형태를 본문에 거의 안 씀 → 신뢰 가능).
+  const turnSpeaker = (ln) => {
+    const m = ln.match(/^###\s+(.+?)\s*$/);
+    return m && roster.has(m[1].trim()) ? m[1].trim() : null;
+  };
+  const starts = [];
+  for (let i = j; i < lines.length; i++) {
+    const sp = turnSpeaker(lines[i]);
+    if (sp) starts.push({ idx: i, speaker: sp });
+  }
+  if (!starts.length) return null;
+
+  // 머리말 영역(첫 발언 앞) → 사전지시·개회 노트·첫 단계 라벨.
+  parseInterstitial(lines.slice(j, starts[0].idx), out, true, null);
+  let curPhase = { label: out._pendingPhaseLabel || '진행',
+                   turns: [], summary: null, interventions: [], notes: [] };
+  out.phases.push(curPhase);
+  delete out._pendingPhaseLabel;
+
+  const lens = (meta && meta.lens) || [];
+  for (let t = 0; t < starts.length; t++) {
+    let seg = lines.slice(starts[t].idx + 1,
+      t + 1 < starts.length ? starts[t + 1].idx : lines.length);
+    if (seg.length && seg[0].trim() === '') seg = seg.slice(1);   // 헤더 뒤 빈 줄 제거
+
+    // 컷: 길이 예산(budget)을 지난 뒤 처음 나오는 구조 마커에서 자른다.
+    // 발언 본문 속 `## 입장`(예산 전)은 내용으로 흡수하고, 진짜 단계 헤더·요약·노트
+    // (예산 후)에서만 컷 → 양자화로 budget 이 근사값이어도 견고하다.
+    const budget = (typeof lens[t] === 'number') ? lens[t] : 0;
+    const isMarker = (ln) =>
+      /^_단계 요약 · /.test(ln) || /^_주요 쟁점:/.test(ln) || /^\*\*사회자 · /.test(ln)
+      || /^>\s*진행자 개입/.test(ln) || /^##\s+/.test(ln);
+    let cut = seg.length, cum = 0;
+    for (let k = 0; k < seg.length; k++) {
+      if (cum >= budget && isMarker(seg[k])) { cut = k; break; }
+      cum += cpLen(seg[k]) + 1;
+    }
+    const content = seg.slice(0, cut);
+    while (content.length && content[content.length - 1].trim() === '') content.pop();
+    curPhase.turns.push({ speaker: starts[t].speaker, content: content.join('\n').trim() });
+
+    const adv = parseInterstitial(seg.slice(cut), out, false, curPhase);
+    if (adv.nextLabel != null) {
+      curPhase = { label: adv.nextLabel, turns: [], summary: null,
+                   interventions: [], notes: [] };
+      out.phases.push(curPhase);
+    }
+  }
+  // 빈 단계(발언이 한 번도 안 들어간 라벨) 정리.
+  out.phases = out.phases.filter((p) => p.turns.length || p.summary || p.notes.length);
+  return out;
+}
+
+// v5 A2는 render_transcript 가 펼친 '모든' 자유 텍스트(주제·참고 자료·개입·사회자
+// 노트·발언·쟁점·합의안)의 정확한 코드포인트 길이를 본문 순서대로 담는다. 렌더러가
+// 만든 구조 줄만 읽고 자유 텍스트는 길이만큼 통째로 소비하므로, 그 안의 `## `·
+// `### 이름` 은 경계 후보가 되지 않는다. 구조가 어긋나면 null(패턴 파서로 폴백).
+function parseWithBlockLengths(md, meta) {
+  // 서버 free() 가 자유 텍스트를 LF 로 정규화한 뒤 길이를 쟀으므로 원본엔 CR 이 없다.
+  // 이 치환은 저장 후 편집기·git 이 파일 전체를 CRLF 로 바꾼 경우만 되돌린다.
+  const text = stripAgoraComments(md).replace(/\r\n/g, '\n');
+  const out = { topic: '', agents: [], facilitator: null, preInstructions: [],
+                referenceMaterials: null, openNote: null, closeNote: null,
+                agreement: null, phases: [] };
+  let pos = 0, k = 0;
+  const lineEnd = () => { const e = text.indexOf('\n', pos); return e < 0 ? text.length : e; };
+  const line = () => text.slice(pos, lineEnd());
+  const next = () => { pos = Math.min(lineEnd() + 1, text.length); };
+  const expect = (ok) => { if (!ok) throw new Error('A2 구조 불일치'); };
+  // pos+skip 부터 다음 앵커 길이만큼 소비하고, 같은 줄의 나머지가 suffix 인지 확인한다.
+  const inline = (skip, suffix = '') => {
+    expect(k < meta.lens.length);
+    const from = pos + skip;
+    let p = from;
+    for (let n = meta.lens[k++]; n > 0; n--) {
+      expect(p < text.length);
+      p += text.codePointAt(p) > 0xFFFF ? 2 : 1;
+    }
+    pos = p;
+    expect(line() === suffix);
+    next();
+    return text.slice(from, p);
+  };
+  // `헤더` / 빈 줄 / 본문 — 렌더러가 넣은 빈 줄 하나를 넘기고 본문을 소비한다.
+  const body = () => { next(); expect(line() === ''); next(); return inline(0); };
+
+  const TITLE = '# Agent Agora — ';
+  try {
+    expect(text.startsWith(TITLE));
+    out.topic = inline(TITLE.length);
+    let section = 'head', phase = null, m;
+    while (pos < text.length) {
+      const ln = line();
+      if (ln === '') { next(); continue; }
+      if ((m = ln.match(/^## (.+)$/))) {
+        section = null;
+        if (m[1] === '참여 에이전트') { section = 'agents'; next(); }
+        else if (m[1] === '진행자 사전 지시') { section = 'pre'; next(); }
+        else if (m[1] === '참고 자료') out.referenceMaterials = body();
+        else if (m[1] === '사회자 — 개회') out.openNote = body();
+        else if (m[1] === '사회자 — 폐회') out.closeNote = body();
+        else if (m[1] === '최종 합의안') out.agreement = body();
+        else {
+          phase = { label: m[1], turns: [], summary: null, interventions: [], notes: [] };
+          out.phases.push(phase);
+          section = 'phase';
+          next();
+        }
+      } else if (section === 'head' && ln.startsWith('- ')) {
+        next();
+      } else if (section === 'agents'
+                 && (m = ln.match(/^- \*\*(.+?)\*\* \(`([^`]+)`\) — (.+)$/))) {
+        out.agents.push({ name: m[1], id: m[2], model: m[3] });
+        next();
+      } else if (section === 'agents' && (m = ln.match(/^- 사회자: \*\*(.+?)\*\* — (.+)$/))) {
+        out.facilitator = { name: m[1], model: m[2] };
+        next();
+      } else if (section === 'pre' && ln.startsWith('> ')) {
+        out.preInstructions.push(inline(2));
+      } else if (section === 'phase' && (m = ln.match(/^### (.+)$/))) {
+        phase.turns.push({ speaker: m[1], content: body() });
+      } else if (section === 'phase' && (m = ln.match(/^_단계 요약 · 합의 근접도 (\d+)%_$/))) {
+        phase.summary = Object.assign(phase.summary || {}, { pct: +m[1] });
+        next();
+      } else if (section === 'phase' && ln.startsWith('_주요 쟁점: ')) {
+        phase.summary = phase.summary || {};
+        phase.summary.conflicts = inline('_주요 쟁점: '.length, '_');
+      } else if (section === 'phase' && (m = ln.match(/^> 진행자 개입(?: \(→ (.+?)\))?: /))) {
+        phase.interventions.push({ target: m[1] || null, message: inline(m[0].length) });
+      } else if (section === 'phase' && (m = ln.match(/^\*\*사회자 · (.+)\*\*$/))) {
+        phase.notes.push({ kind: m[1], content: body() });
+      } else {
+        expect(false);
+      }
+    }
+    expect(k === meta.lens.length);
+  } catch (e) { return null; }
+  return out;
+}
+
+// 저장된 .md → 구조화 결과. v5 힌트는 정확한 블록 파서, v3·v4(발언 길이만)는 근사
+// 앵커 파서, 힌트가 없거나 실패하면 패턴 파서(비엄밀 폴백).
+function parseLoadedTranscript(md, meta) {
+  return (meta && (meta.version === 5 ? parseWithBlockLengths(md, meta)
+                                      : parseWithAnchors(md, meta)))
+    || parseAgoraTranscript(md);
 }
 
 // ---- 저장된 .md 토론을 라이브 UI 구조로 복원 (패턴 기반, 비엄밀) ------------
@@ -743,7 +1052,8 @@ function parseAgoraTranscript(md) {
   }
 
   const out = { topic: topic, agents: [], facilitator: null, preInstructions: [],
-                openNote: null, closeNote: null, agreement: null, phases: [] };
+                referenceMaterials: null, openNote: null, closeNote: null,
+                agreement: null, phases: [] };
   for (const sec of sections) {
     const h = sec.header;
     if (h === '참여 에이전트') {
@@ -758,6 +1068,8 @@ function parseAgoraTranscript(md) {
         const m = ln.match(/^>\s?(.*)$/);
         if (m && m[1].trim()) out.preInstructions.push(m[1].trim());
       }
+    } else if (h === '참고 자료') {
+      out.referenceMaterials = sec.lines.join('\n').trim();
     } else if (h === '사회자 — 개회') {
       out.openNote = sec.lines.join('\n').trim();
     } else if (h === '사회자 — 폐회') {
@@ -790,8 +1102,8 @@ function parsePhaseSection(label, lines) {
     if (m) { flush(); phase.summary = phase.summary || {}; phase.summary.pct = +m[1]; continue; }
     m = ln.match(/^_주요 쟁점:\s*(.+?)_\s*$/);
     if (m) { phase.summary = phase.summary || {}; phase.summary.conflicts = m[1].trim(); continue; }
-    m = ln.match(/^>\s*진행자 개입:\s*(.+)$/);
-    if (m) { flush(); phase.interventions.push(m[1].trim()); continue; }
+    m = ln.match(/^>\s*진행자 개입(?:\s+\(→\s*(.+?)\))?:\s*(.+)$/);
+    if (m) { flush(); phase.interventions.push({ target: m[1] || null, message: m[2].trim() }); continue; }
     buf.push(ln);
   }
   flush();
@@ -802,12 +1114,13 @@ function parsePhaseSection(label, lines) {
 const LOADED_BUBBLE_PALETTE = ['ideator', 'builder', 'critic',
                                'synthesizer', 'pragmatist', 'analyst'];
 
-function renderLoadedTranscript(md) {
-  const parsed = parseAgoraTranscript(md);
+function renderLoadedTranscript(md, meta) {
+  const parsed = parseLoadedTranscript(md, meta);
   if (!parsed) return false;
   const speakerColor = {};
   parsed.agents.forEach((a, i) => {
-    speakerColor[a.name] = LOADED_BUBBLE_PALETTE[i % LOADED_BUBBLE_PALETTE.length];
+    const t = meta && meta.types && meta.types[i];   // 힌트의 정확한 persona 색 우선
+    speakerColor[a.name] = t || LOADED_BUBBLE_PALETTE[i % LOADED_BUBBLE_PALETTE.length];
   });
   const frag = document.createDocumentFragment();
 
@@ -832,6 +1145,14 @@ function renderLoadedTranscript(md) {
   }
   parsed.preInstructions.forEach((msg) =>
     frag.appendChild(buildHintCard('🙋 참가자 H 사전 지시', msg)));
+  if (parsed.referenceMaterials) {
+    const ref = document.createElement('details');
+    ref.className = 'bg-white border border-slate-200 rounded-lg p-3 mb-4 text-sm';
+    ref.innerHTML = '<summary class="cursor-pointer text-xs font-semibold text-slate-500">'
+      + '📎 참고 자료 (에이전트 공통 주입)</summary>'
+      + '<div class="md mt-2 text-slate-800">' + renderMarkdown(parsed.referenceMaterials) + '</div>';
+    frag.appendChild(ref);
+  }
   if (parsed.openNote) frag.appendChild(buildFacNoteCard('개회', parsed.openNote));
 
   parsed.phases.forEach((ph) => {
@@ -847,8 +1168,11 @@ function renderLoadedTranscript(md) {
       body.appendChild(buildBubbleCard(t.speaker, t.content,
                                        speakerColor[t.speaker] || 'neutral')));
     if (ph.summary) body.appendChild(buildSummaryCard(ph.summary));
-    ph.interventions.forEach((msg) =>
-      body.appendChild(buildHintCard('🙋 참가자 H 개입', msg)));
+    ph.interventions.forEach((item) => {
+      const iv = typeof item === 'string' ? { message: item, target: null } : item;
+      const suffix = iv.target ? ' → ' + iv.target : '';
+      body.appendChild(buildHintCard('🙋 참가자 H 개입' + suffix, iv.message));
+    });
     ph.notes.forEach((n) => body.appendChild(buildFacNoteCard(n.kind, n.content)));
     frag.appendChild(sec);
   });
@@ -954,6 +1278,33 @@ function buildCompareMeta(state) {
   };
 }
 
+// A2 힌트(또는 폴백)로 본문을 파싱해 비교용 메타를 만든다 — 전체상태 블록 없이도 동작.
+function buildCompareMetaFromBody(md) {
+  const meta = decodeMetaA2(md);
+  const parsed = parseLoadedTranscript(md, meta);
+  if (!parsed) return null;
+  const lineup = (parsed.agents || []).map((a) => a.name + ' (' + a.model + ')');
+  if (parsed.facilitator) {
+    lineup.push('🎙 ' + parsed.facilitator.name + ' (' + parsed.facilitator.model + ')');
+  }
+  const trajectory = (parsed.phases || [])
+    .map((p) => (p.summary && typeof p.summary.pct === 'number') ? p.summary.pct + '%' : null)
+    .filter(Boolean).join(' → ');
+  const tokM = md.match(/^- 토큰:[^\n]*합계\s*([\d,]+)/m);
+  const fmtM = md.match(/^- 형식:[^\n]*\(`([^`]+)`\)/m);
+  const stM = md.match(/^- 상태:\s*(.+?)\s*$/m);
+  return {
+    topic: parsed.topic || '',
+    format: (meta && meta.fmt) || (fmtM ? fmtM[1] : ''),
+    status: stM ? stM[1] : '',
+    lineup: lineup,
+    phases: (parsed.phases || []).length,
+    trajectory: trajectory || '—',
+    agreement: parsed.agreement ? '있음' : '없음',
+    tokens: tokM ? parseInt(tokM[1].replace(/,/g, ''), 10) : 0,
+  };
+}
+
 function enterCompareMode(items) {
   resetDiscussion();
   $('topicCard').classList.add('hidden');
@@ -961,7 +1312,11 @@ function enterCompareMode(items) {
   clearTimeline();
   const ph = $('placeholder'); if (ph) ph.remove();
 
-  const metas = items.map((it) => buildCompareMeta(extractEmbeddedState(it.text)));
+  // 예전 V1 전체상태 파일은 그 블록으로, 신형 A2 파일은 본문 파싱으로 메타 구성.
+  const metas = items.map((it) => {
+    const v1 = extractEmbeddedState(it.text);
+    return v1 ? buildCompareMeta(v1) : buildCompareMetaFromBody(it.text);
+  });
 
   // ── 메타 대조표 ──
   const rows = [
@@ -998,7 +1353,7 @@ function enterCompareMode(items) {
   const grid = document.createElement('div');
   grid.className = 'grid grid-cols-2 gap-4';
   items.forEach((it) => {
-    const body = it.text.replace(/<!--\s*AGORA-STATE-V1[\s\S]*?-->/, '');
+    const body = stripAgoraComments(it.text);
     const col = document.createElement('article');
     col.className = 'md bg-white border border-slate-200 rounded-lg p-4 '
                   + 'max-h-[70vh] overflow-y-auto';
@@ -1029,6 +1384,9 @@ async function exportDiscussion() {
 }
 
 function connectWS(id) {
+  saveSession(id);   // 재접속 가능하도록 진행 중 토론 ID 를 보존
+  // 복구 경로에서도 새 토론을 중복 생성하지 않는다. 완료/오류 스냅샷만 다시 연다.
+  $('startBtn').disabled = true;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/discussions/${id}/ws`);
   ws.onopen = () => {
@@ -1041,7 +1399,9 @@ function connectWS(id) {
   };
   ws.onclose = (ev) => {
     if (ev && ev.code === 4004) {       // 서버: 토론 없음 — 재연결 무의미
-      setStatus('토론을 찾을 수 없음', 'error');
+      clearSession();                   // 사라진 토론 ID 는 정리해 다음 부팅을 깨끗이
+      resetDiscussion();                // 시작 전 설정 화면으로 복귀
+      setStatus('이전 토론을 찾을 수 없어 새로 시작합니다', 'error');
       return;
     }
     scheduleReconnect(id);              // 그 외 단절 → 지수 백오프 재연결
@@ -1577,6 +1937,8 @@ function renderSnapshot(state) {
   // 끝난 직후 복원한다(restoreDrafts) — 일시적 단절에도 입력 글자를 잃지 않도록.
   const drafts = captureDrafts();
   renderStateContent(state);
+  // 복구 중에는 새 토론을 만들 수 없다. 서버가 종료/오류를 확인한 경우만 허용한다.
+  $('startBtn').disabled = !['completed', 'error'].includes(state.status);
 
   if (state.status === 'waiting_for_user') {
     onAwaitingUser({ completed_phase: state.current_phase });
@@ -1837,7 +2199,21 @@ $('compareFileInput').addEventListener('change', onCompareFilesChange);
 $('topicInput').addEventListener('input', autoGrowTopic);
 $('formatSelect').addEventListener('change', onFormatChange);
 autoGrowTopic();   // 기본 주제 텍스트에 맞춰 초기 높이 조정
-loadFormats();     // 형식 목록 로드 + 드롭다운 채우기
+
+// 저장된 세션이 있으면 자동 재접속 — 서버가 전체 스냅샷으로 UI 를 복원한다.
+// (형식 목록을 먼저 로드해 두면 스냅샷 렌더 시 형식 라벨이 정확하다.)
+function maybeResumeSession() {
+  const id = savedSession();
+  if (!id) return;
+  discussionId = id;
+  $('startBtn').disabled = true;       // 스냅샷으로 종료 여부를 확인하기 전까지 잠근다
+  setTopicReadOnly(true);   // 진행 중 토론 — 주제는 렌더 뷰로 고정
+  clearTimeline();
+  bubbles = {};
+  setStatus('이전 토론에 재접속 중…', 'run');
+  connectWS(id);
+}
+loadFormats().then(maybeResumeSession);   // 형식 목록 로드 후 자동 재접속 시도
 </script>
 </body>
 </html>

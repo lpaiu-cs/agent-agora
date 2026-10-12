@@ -893,11 +893,29 @@ def render_transcript(state: DiscussionState) -> str:
     프롬프트용 ``_render_history`` 와 달리 LTM 압축을 적용하지 않고, 모든 단계의
     발언 원문·요약·진행자 개입·최종 합의안을 사람이 읽기 좋은 문서로 펼친다.
     """
+    return _render_transcript_parts(state)[0]
+
+
+def _render_transcript_parts(state: DiscussionState) -> tuple[str, list[str]]:
+    """(기록 문서, 문서에 펼친 자유 텍스트 블록 — 본문 순서 그대로) 를 만든다.
+
+    자유 텍스트(주제·참고 자료·개입·사회자 노트·발언·쟁점·합의안)는 모두 ``free()``
+    를 거쳐 렌더되므로, A2 길이 앵커의 순서가 렌더 순서와 어긋날 수 없다.
+    줄바꿈은 여기서 LF 로 정규화한다(CR/CRLF → LF) — 본문에 쓰는 문자열과 길이를
+    재는 문자열이 같아야 하고, 클라이언트 파서는 CRLF → LF 치환을 거친 본문을 읽는다.
+    """
+    blocks: list[str] = []
+
+    def free(text: str) -> str:
+        text = re.sub(r"\r\n?", "\n", text)
+        blocks.append(text)
+        return text
+
     fmt = _format_of(state)
     name_of = {a.agent_id: a.name for a in state.agents}
     summary_of = {s.phase: s for s in state.phase_summaries}
     lines: list[str] = [
-        f"# Agent Agora — {state.topic}",
+        f"# Agent Agora — {free(state.topic)}",
         "",
         f"- 형식: {fmt.name} (`{state.format_id}`)",
         f"- 상태: {state.status.value}",
@@ -918,17 +936,17 @@ def render_transcript(state: DiscussionState) -> str:
             f"- 사회자: **{state.facilitator.name}** — {state.facilitator.model}")
 
     if state.reference_materials:
-        lines += ["", "## 참고 자료", "", state.reference_materials]
+        lines += ["", "## 참고 자료", "", free(state.reference_materials)]
 
     pre = [iv for iv in state.user_interventions if iv.after_phase is None]
     if pre:
         lines += ["", "## 진행자 사전 지시", ""]
-        lines += [f"> {iv.message}" for iv in pre]
+        lines += [f"> {free(iv.message)}" for iv in pre]
 
     opening = next(
         (n for n in state.facilitator_notes if n.kind == "open"), None)
     if opening is not None:
-        lines += ["", "## 사회자 — 개회", "", opening.content]
+        lines += ["", "## 사회자 — 개회", "", free(opening.content)]
 
     for spec, rnd, key in _instances_in_order(fmt, state):
         turns = state.phase_records.get(key, [])
@@ -937,34 +955,34 @@ def render_transcript(state: DiscussionState) -> str:
         lines += ["", f"## {_instance_label(spec, rnd)}", ""]
         for turn in turns:
             speaker = name_of.get(turn.agent_id, turn.agent_id)
-            lines += [f"### {speaker}", "", turn.content, ""]
+            lines += [f"### {speaker}", "", free(turn.content), ""]
         summary = summary_of.get(key)
         if summary:
             lines.append(
                 f"_단계 요약 · 합의 근접도 {summary.convergence_score:.0%}_")
             if summary.key_conflicts:
                 lines.append(
-                    f"_주요 쟁점: {' · '.join(summary.key_conflicts)}_")
+                    f"_주요 쟁점: {free(' · '.join(summary.key_conflicts))}_")
         for iv in state.user_interventions:
             if iv.after_phase == key:
                 target = ""
                 if iv.target_agent_id:
                     tname = name_of.get(iv.target_agent_id, iv.target_agent_id)
                     target = f" (→ {tname})"
-                lines.append(f"> 진행자 개입{target}: {iv.message}")
+                lines.append(f"> 진행자 개입{target}: {free(iv.message)}")
         for note in state.facilitator_notes:
             if note.phase == key and note.kind in ("between", "decision"):
                 tag = "진행 결정" if note.kind == "decision" else "중간 조율"
-                lines += ["", f"**사회자 · {tag}**", "", note.content]
+                lines += ["", f"**사회자 · {tag}**", "", free(note.content)]
 
     closing = next(
         (n for n in state.facilitator_notes if n.kind == "close"), None)
     if closing is not None:
-        lines += ["", "## 사회자 — 폐회", "", closing.content]
+        lines += ["", "## 사회자 — 폐회", "", free(closing.content)]
 
     if state.final_joint_agreement:
-        lines += ["", "## 최종 합의안", "", state.final_joint_agreement]
-    return "\n".join(lines) + "\n"
+        lines += ["", "## 최종 합의안", "", free(state.final_joint_agreement)]
+    return "\n".join(lines) + "\n", blocks
 
 
 #: .md 끝에 심는 복원용 상태 블록의 마커. HTML 주석이라 마크다운 렌더에 안 보인다.
@@ -972,18 +990,108 @@ _STATE_BLOCK_RE = re.compile(
     r"<!--\s*AGORA-STATE-V1\n([A-Za-z0-9+/=\s]+?)\n-->", re.DOTALL)
 
 
-def render_transcript_with_state(state: DiscussionState) -> str:
-    """기록 문서 + 복원용 상태 블록.
+# --- 초소형 복원 힌트(A2, 바이너리 v5) ----------------------------------------
+# 예전 V1 은 전체 상태(모든 발언 원문)를 base64(JSON) 로 통째 심어 .md 끝이 비대했다
+# (발언량에 비례). 본문 자체가 이미 완전한 사람용 기록이고 '불러오기' 는 읽기 전용
+# 이므로, 본문을 파서로 복원하고 본문에서 못 얻는 최소치만 압축 바이너리로 남긴다:
+#   · 에이전트별 persona_type(말풍선 색 — 본문에 없는 유일한 표시 정보)
+#   · 자유 텍스트 블록별 정확한 길이 — 발언뿐 아니라 주제·참고 자료·개입·사회자
+#     노트·쟁점·합의안까지. 파서는 렌더러가 만든 구조 줄만 읽고 자유 텍스트는 길이만큼
+#     통째로 소비하므로, 그 안의 `## `·`### 이름` 은 경계 후보가 되지 않는다.
+# 압축 3종: ① format_id 는 본문(`- 형식: …(`id`)`)에 있으니 빼고,
+# ② persona 인덱스는 4비트씩 니블 패킹, ③ 길이는 정확한 varint로 기록한다.
+# 블록 크기는 토론 길이가 아니라 (에이전트+블록) 수에만 비례하고, base64 라 안 읽힌다.
+_PERSONA_TABLE = [
+    "ideator", "builder", "critic", "synthesizer", "pragmatist", "neutral",
+    "proponent", "opponent", "fact_checker", "mediator", "analyst",
+]  # 인덱스=enum 선언 순서(0~10). 니블 0xF=미상. 클라이언트의 같은 표와 일치해야 한다.
+def _write_uvarint(buf: bytearray, n: int) -> None:
+    """부호 없는 LEB128 varint 를 buf 에 덧붙인다 (발언 길이용 — 가변 1~N바이트)."""
+    n = int(n)
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        buf.append(b | 0x80 if n else b)
+        if not n:
+            return
 
-    사람이 읽는 마크다운 본문은 ``render_transcript`` 그대로 두고, 끝에 전체
-    ``DiscussionState`` 를 base64(JSON) HTML 주석으로 심는다 — .md 파일 하나가
-    사람용 기록이자 기계용 완전 복원 소스가 된다(별도 sidecar 파일 불필요).
-    base64 인코딩은 본문에 '-->' 같은 문자가 들어가 주석이 깨지는 것을 막는다.
+
+def _read_uvarint(raw: bytes, pos: int) -> tuple[int, int]:
+    """raw[pos:] 에서 uvarint 하나를 읽어 (값, 다음 pos) 반환 (역직렬화 검증용)."""
+    result = shift = 0
+    while True:
+        b = raw[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+
+
+def encode_meta_hint(state: DiscussionState) -> str:
+    """복원 힌트를 압축 바이너리로 만들어 base64 문자열로 반환한다.
+
+    레이아웃(바이트): [버전=5][acount][persona 니블 × ⌈acount/2⌉]
+    [블록수 varint][정확한 길이 varint × 블록수]. 니블 0xF=persona 미상.
+    블록 = ``_render_transcript_parts`` 가 본문에 펼친 자유 텍스트, 본문 순서.
+
+    길이를 근사하거나 일부 필드만 저장하면 자유 텍스트 속 Markdown 구조 마커를
+    실제 경계로 오인할 수 있으므로, 모든 자유 텍스트의 경계를 정확히 보존한다.
     """
-    payload = base64.b64encode(
-        state.model_dump_json().encode("utf-8")).decode("ascii")
-    return (render_transcript(state)
-            + f"\n<!-- AGORA-STATE-V1\n{payload}\n-->\n")
+    buf = bytearray([5])
+    agents = state.agents[:255]
+    buf.append(len(agents))
+    idxs = []
+    for a in agents:
+        try:
+            idxs.append(_PERSONA_TABLE.index(a.persona_type))
+        except ValueError:
+            idxs.append(0xF)
+    for i in range(0, len(idxs), 2):          # persona 인덱스 2개 → 1바이트(니블)
+        hi = idxs[i] & 0xF
+        lo = (idxs[i + 1] & 0xF) if i + 1 < len(idxs) else 0xF
+        buf.append((hi << 4) | lo)
+    blocks = _render_transcript_parts(state)[1]
+    _write_uvarint(buf, len(blocks))
+    for block in blocks:
+        _write_uvarint(buf, len(block))
+    return base64.b64encode(bytes(buf)).decode("ascii")
+
+
+def decode_meta_hint(b64: str) -> Optional[dict]:
+    """encode_meta_hint(v5) 의 역연산. 기존 v3·v4(발언 길이만) 힌트도 읽는다."""
+    raw = base64.b64decode(b64)
+    if not raw or raw[0] not in (3, 4, 5):
+        return None
+    pos = 1
+    acount = raw[pos]; pos += 1
+    idxs: list[int] = []
+    for _ in range((acount + 1) // 2):
+        byte = raw[pos]; pos += 1
+        idxs.append((byte >> 4) & 0xF)
+        idxs.append(byte & 0xF)
+    idxs = idxs[:acount]
+    types = [_PERSONA_TABLE[i] if i < len(_PERSONA_TABLE) else None for i in idxs]
+    tcount, pos = _read_uvarint(raw, pos)
+    lens = []
+    for _ in range(tcount):
+        if raw[0] == 3:
+            # 이미 저장된 v3 파일을 위한 읽기 호환. 이 값은 근사 하한이다.
+            lens.append(raw[pos] << 5); pos += 1
+        else:
+            length, pos = _read_uvarint(raw, pos)
+            lens.append(length)
+    return {"version": raw[0], "types": types, "lens": lens}
+
+
+def render_transcript_with_meta(state: DiscussionState) -> str:
+    """기록 문서(사람용) + 초소형 복원 힌트(A2) 한 줄.
+
+    본문은 ``render_transcript`` 그대로 두고, 끝에 ``encode_meta_hint`` 결과를
+    ``<!-- A2 ... -->`` 주석으로 단다. 본문이 복원의 1차 소스이고, 이 힌트는
+    persona 색과 자유 텍스트 길이 앵커만 보강한다 — 원문을 중복 저장하지 않는다.
+    """
+    return render_transcript(state) + f"\n<!-- A2 {encode_meta_hint(state)} -->\n"
 
 
 def extract_embedded_state(markdown: str) -> Optional[DiscussionState]:
@@ -1011,7 +1119,7 @@ def archive_transcript(state: DiscussionState) -> str:
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"agora-{state.discussion_id[:8]}.md")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_transcript_with_state(state))
+        fh.write(render_transcript_with_meta(state))
     return path
 
 
