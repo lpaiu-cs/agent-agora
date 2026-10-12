@@ -273,19 +273,21 @@ let tokenBudget = null;        // 토론의 토큰 예산 (선택 — null 이�
 
 // ---- 세션 지속(persist) — 뒤로가기·새로고침 후 자동 재접속 ------------------
 // discussionId 는 메모리 변수라, 뒤로가기 등으로 페이지가 리셋되면 진행 중 토론과의
-// 연결이 끊긴다(데이터는 DB 에 살아있음). localStorage 에 보존해 두면 부팅 시
+// 연결이 끊긴다(데이터는 DB 에 살아있음). sessionStorage 에 보존해 두면 부팅 시
 // 자동 재접속해 서버 스냅샷으로 UI 를 그대로 복원할 수 있다.
+// 탭 단위(sessionStorage)여야 한다 — origin 공용(localStorage)이면 다른 탭의 토론
+// 시작·리셋이 이 탭의 복구 ID 를 덮어쓰거나 지워, 새로고침 시 엉뚱한 토론에 붙는다.
 // URL 에는 넣지 않는다 — 토론 ID 는 인증 없이 조회·개입 권한을 주므로, 주소를
 // 복사해 공유하는 순간 토론이 함께 넘어간다.
 const SESSION_KEY = 'agora.discussionId';
 function saveSession(id) {
-  try { localStorage.setItem(SESSION_KEY, id); } catch (e) { /* 사생활 모드 등 */ }
+  try { sessionStorage.setItem(SESSION_KEY, id); } catch (e) { /* 사생활 모드 등 */ }
 }
 function clearSession() {
-  try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
 }
 function savedSession() {
-  try { return (localStorage.getItem(SESSION_KEY) || '').trim() || null; } catch (e) { return null; }
+  try { return (sessionStorage.getItem(SESSION_KEY) || '').trim() || null; } catch (e) { return null; }
 }
 
 // ---- DOM 핸들 --------------------------------------------------------------
