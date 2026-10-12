@@ -901,10 +901,13 @@ def _render_transcript_parts(state: DiscussionState) -> tuple[str, list[str]]:
 
     자유 텍스트(주제·참고 자료·개입·사회자 노트·발언·쟁점·합의안)는 모두 ``free()``
     를 거쳐 렌더되므로, A2 길이 앵커의 순서가 렌더 순서와 어긋날 수 없다.
+    줄바꿈은 여기서 LF 로 정규화한다(CR/CRLF → LF) — 본문에 쓰는 문자열과 길이를
+    재는 문자열이 같아야 하고, 클라이언트 파서는 CRLF → LF 치환을 거친 본문을 읽는다.
     """
     blocks: list[str] = []
 
     def free(text: str) -> str:
+        text = re.sub(r"\r\n?", "\n", text)
         blocks.append(text)
         return text
 

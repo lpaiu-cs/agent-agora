@@ -273,22 +273,18 @@ let tokenBudget = null;        // 토론의 토큰 예산 (선택 — null 이�
 
 // ---- 세션 지속(persist) — 뒤로가기·새로고침 후 자동 재접속 ------------------
 // discussionId 는 메모리 변수라, 뒤로가기 등으로 페이지가 리셋되면 진행 중 토론과의
-// 연결이 끊긴다(데이터는 DB 에 살아있음). localStorage + URL 해시에 보존해 두면
-// 부팅 시 자동 재접속해 서버 스냅샷으로 UI 를 그대로 복원할 수 있다.
+// 연결이 끊긴다(데이터는 DB 에 살아있음). localStorage 에 보존해 두면 부팅 시
+// 자동 재접속해 서버 스냅샷으로 UI 를 그대로 복원할 수 있다.
+// URL 에는 넣지 않는다 — 토론 ID 는 인증 없이 조회·개입 권한을 주므로, 주소를
+// 복사해 공유하는 순간 토론이 함께 넘어간다.
 const SESSION_KEY = 'agora.discussionId';
 function saveSession(id) {
   try { localStorage.setItem(SESSION_KEY, id); } catch (e) { /* 사생활 모드 등 */ }
-  if (location.hash.slice(1) !== id) {
-    history.replaceState(null, '', location.pathname + location.search + '#' + id);
-  }
 }
 function clearSession() {
   try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
-  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
 }
 function savedSession() {
-  const fromHash = location.hash.slice(1).trim();
-  if (fromHash) return fromHash;
   try { return (localStorage.getItem(SESSION_KEY) || '').trim() || null; } catch (e) { return null; }
 }
 
@@ -925,6 +921,8 @@ function parseWithAnchors(md, meta) {
 // 만든 구조 줄만 읽고 자유 텍스트는 길이만큼 통째로 소비하므로, 그 안의 `## `·
 // `### 이름` 은 경계 후보가 되지 않는다. 구조가 어긋나면 null(패턴 파서로 폴백).
 function parseWithBlockLengths(md, meta) {
+  // 서버 free() 가 자유 텍스트를 LF 로 정규화한 뒤 길이를 쟀으므로 원본엔 CR 이 없다.
+  // 이 치환은 저장 후 편집기·git 이 파일 전체를 CRLF 로 바꾼 경우만 되돌린다.
   const text = stripAgoraComments(md).replace(/\r\n/g, '\n');
   const out = { topic: '', agents: [], facilitator: null, preInstructions: [],
                 referenceMaterials: null, openNote: null, closeNote: null,

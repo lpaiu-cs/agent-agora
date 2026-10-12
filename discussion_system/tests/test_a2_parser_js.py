@@ -106,3 +106,23 @@ def test_v5_parser_keeps_markdown_inside_every_free_text_block():
     assert phase["summary"] == {"pct": 70, "conflicts": "쟁점_1 · 쟁점\n## 2"}
     assert phase["interventions"] == [{"target": "A", "message": "A에게만" + trap}]
     assert phase["notes"] == [{"kind": "중간 조율", "content": "조율" + trap}]
+
+
+@pytest.mark.parametrize("to_crlf", [False, True], ids=["as_exported", "file_converted_to_crlf"])
+def test_v5_parser_handles_crlf_in_free_text(to_crlf):
+    # LLM/API 가 CRLF·단독 CR 을 돌려준 발언 + 저장 후 편집기·git 이 파일 전체를 CRLF 로 바꾼 경우.
+    raw = "첫 줄\r\n## 세부 근거\r\n### B\r내용"
+    state = DiscussionState(discussion_id="d", topic="주제",
+                            agents=[_agent("a0", "A"), _agent("a1", "B")])
+    state.phase_records = {"opinion": [
+        AgentTurn(agent_id="a0", phase="opinion", content=raw),
+        AgentTurn(agent_id="a1", phase="opinion", content="둘째"),
+    ]}
+    doc = render_transcript_with_meta(state)
+    if to_crlf:
+        doc = doc.replace("\n", "\r\n")
+
+    parsed = _parse_in_browser_parser(doc)
+
+    assert [(t["speaker"], t["content"]) for t in parsed["phases"][0]["turns"]] == [
+        ("A", "첫 줄\n## 세부 근거\n### B\n내용"), ("B", "둘째")]
